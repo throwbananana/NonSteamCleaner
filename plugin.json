@@ -1,0 +1,10 @@
+{
+  "name": "NonSteamCleaner",
+  "display_name": "非Steam游戏清理",
+  "author": "you",
+  "description": "彻底清理 Steam 中添加的非 Steam 游戏：可选择删除本体 / 本体+存档 / 本体+存档+着色器缓存 / 本体+着色器缓存，并移除 Steam 库中的快捷方式。",
+  "version": "1.0.0",
+  "py_version": "3.10",
+  "main": "main.py",
+  "flags": []
+}

@@ -1,0 +1,59 @@
+name: Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find plugin directory
+        id: find
+        run: |
+          # 兼容插件在仓库根目录或某个子目录的情况
+          DIR=$(find . -maxdepth 2 -name plugin.json -not -path '*/node_modules/*' | head -n1 | xargs dirname)
+          echo "plugin_dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "Found plugin at: $DIR"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install & Build frontend
+        working-directory: ${{ steps.find.outputs.plugin_dir }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Remove build dependencies (减小体积)
+        working-directory: ${{ steps.find.outputs.plugin_dir }}
+        run: rm -rf node_modules
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          DIR="${{ steps.find.outputs.plugin_dir }}"
+          NAME=$(node -p "require('./$DIR/plugin.json').name")
+          PKG="${NAME}.tar.gz"
+          # 顶层包成 <name>/ 目录，方便解压到 homebrew/plugins/
+          tar -czf "$PKG" --transform "s,^\.,$NAME," -C "$DIR" .
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.pkg }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
