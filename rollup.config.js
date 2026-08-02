@@ -1,28 +1,28 @@
 import typescript from '@rollup/plugin-typescript';
-import resolve from '@rollup/plugin-node-resolve';
-import commonjs from '@rollup/plugin-commonjs';
-import replace from '@rollup/plugin-replace';
 import terser from '@rollup/plugin-terser';
 
+/**
+ * Decky Loader v3 默认用 ESMODULE_V1 加载插件：
+ *   const plugin_exports = await import(.../dist/index.js);
+ *   let plugin = plugin_exports.default();
+ *
+ * 因此必须输出 ES module，且 export default 为一个可调用函数。
+ * SP_REACT / DFL 由 Steam/Decky 注入为全局，源码直接引用，禁止打包 React。
+ */
 export default {
   input: 'src/index.tsx',
   output: {
     file: 'dist/index.js',
-    format: 'iife',
-    name: 'plugin',
+    format: 'es',
     sourcemap: false,
-    // Steam 的浏览器环境没有 Node 的 process，提供 shim 作为兜底
-    banner: 'var process = process || { env: { NODE_ENV: "production" } };',
   },
+  // 不解析 react / decky-frontend-lib —— 源码已改用全局 SP_REACT / DFL
   plugins: [
-    // react / decky-frontend-lib 会读取 process.env.NODE_ENV，必须内联替换掉
-    replace({
-      preventAssignment: true,
-      values: { 'process.env.NODE_ENV': JSON.stringify('production') },
+    typescript({
+      tsconfig: './tsconfig.json',
+      // 声明了 SP_REACT 等全局，无需真实模块
+      noEmitOnError: false,
     }),
-    resolve(),
-    commonjs(),
-    typescript(),
     terser(),
   ],
 };
