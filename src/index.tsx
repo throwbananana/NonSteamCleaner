@@ -51,6 +51,20 @@ const purgeMissingNonsteamGames = callable('purge_missing_nonsteam_games');
 const hideScanItems = callable('hide_scan_items');
 const unhideScanItems = callable('unhide_scan_items');
 const getHiddenScanItems = callable('get_hidden_scan_items');
+const markScanItemsTrouble = callable('mark_scan_items_trouble');
+const unmarkScanItemsTrouble = callable('unmark_scan_items_trouble');
+const repairNonsteamIcons = callable('repair_nonsteam_icons');
+const repairCjkFonts = callable('repair_cjk_fonts');
+const getCjkFontLangOptions = callable('get_cjk_font_lang_options');
+const setIconFromScreenshot = callable('set_icon_from_screenshot');
+const captureAndSetIcon = callable('capture_and_set_icon');
+const setIconFromLatestScreenshot = callable('set_icon_from_latest_screenshot');
+const listNonsteamForIcon = callable('list_nonsteam_for_icon');
+const getRunningNonsteamGame = callable('get_running_nonsteam_game');
+const getPluginStatus = callable('get_plugin_status');
+const findDuplicateNonsteamGames = callable('find_duplicate_nonsteam_games');
+const purgeDuplicateShortcuts = callable('purge_duplicate_shortcuts');
+const fixGamePageTitles = callable('fix_game_page_titles');
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -83,6 +97,13 @@ const OPTIONS: DeleteOption[] = [
     shader: true,
   },
   { id: 'body_shader', label: '删除本体 + 着色器缓存', body: true, saves: false, shader: true },
+];
+
+/** 修复汉化字体语言选项 */
+const CJK_LANG_OPTIONS: { id: string; label: string }[] = [
+  { id: 'zh_CN', label: '简体中文' },
+  { id: 'ja_JP', label: '日文' },
+  { id: 'zh_TW', label: '繁体中文' },
 ];
 
 const LOG = (...a: any[]) => console.log('[NonSteamCleaner]', ...a);
@@ -245,6 +266,113 @@ function buildDeleteArgs(game: NonSteamGame, opt: DeleteOption) {
   };
 }
 
+async function runRepairCjkFontsFlow(
+  appid: number,
+  lang: string = 'zh_CN',
+  titleHint?: string
+) {
+  const game = await resolveGame(appid, titleHint);
+  if (!game) {
+    toast('修复汉化字体', '未找到该非 Steam 游戏。');
+    return;
+  }
+  const langLabel = CJK_LANG_OPTIONS.find((x) => x.id === lang)?.label || lang;
+  showConfirmModalSoft({
+    title: `修复汉化字体：${game.name || titleHint || game.appid}`,
+    okText: '开始修复',
+    body:
+      `将按「${langLabel}」修复：\n` +
+      `· Proton 前缀区域/代码页（中文 GBK / 日文 Shift-JIS）\n` +
+      `· 黑体等字体映射（若适用）\n` +
+      `· Steam 启动项写入 LANG/LC_ALL\n\n` +
+      `用于解决老汉化/日文游戏文字变成 ?? 的问题。\n` +
+      `修复后请完全退出 Steam 再启动游戏。`,
+    onConfirm: async () => {
+      try {
+        toast('修复汉化字体', '正在修复…');
+        const r = unwrapResult(
+          await repairCjkFonts({
+            appid: normalizeAppId(game.appid),
+            userdata_id: String(game.userdata_id || ''),
+            key: String(game.key ?? ''),
+            name: String(game.name || ''),
+            lang,
+          })
+        );
+        toast('修复汉化字体', r?.message || '完成');
+      } catch (e) {
+        toast('修复汉化字体', '失败: ' + String(e));
+      }
+    },
+  });
+}
+
+// 覆盖 ConfirmModal 默认按钮文案：修复场景用「确认」而非「确认删除」
+function showConfirmModalSoft(opts: {
+  title: string;
+  body: any;
+  okText?: string;
+  onConfirm: () => void | Promise<void>;
+}) {
+  const ConfirmModal = DFL.ConfirmModal;
+  const showModal = DFL.showModal;
+  if (typeof showModal === 'function' && ConfirmModal) {
+    showModal(
+      React.createElement(ConfirmModal, {
+        strTitle: opts.title,
+        strDescription: opts.body,
+        strOKButtonText: opts.okText || '确认',
+        strCancelButtonText: '取消',
+        onOK: () => {
+          void opts.onConfirm();
+        },
+        bDestructiveWarning: false,
+      })
+    );
+    return;
+  }
+  if (window.confirm(opts.title + '\n\n' + String(opts.body))) {
+    void opts.onConfirm();
+  }
+}
+
+async function runMarkTroubleFlow(appid: number, mark: boolean, titleHint?: string) {
+  const game = await resolveGame(appid, titleHint);
+  if (!game) {
+    toast(mark ? '标记 -trouble' : '取消 -trouble', '未找到该非 Steam 游戏');
+    return;
+  }
+  const exe = String(game.exe || '').trim();
+  if (!exe) {
+    toast(mark ? '标记 -trouble' : '取消 -trouble', '该游戏没有有效启动路径');
+    return;
+  }
+  const name = game.name || titleHint || String(appid);
+  const ok = window.confirm(
+    mark
+      ? `将把「${name}」的游戏文件夹重命名为「原名-trouble」。\n\n不会删除文件；Steam 快捷方式路径会同步更新。\n有问题时可用此标记代替删除。\n\n继续？`
+      : `将去掉「${name}」文件夹名末尾的「-trouble」标记。\n不会删除文件。\n\n继续？`
+  );
+  if (!ok) return;
+  try {
+    const api = mark ? markScanItemsTrouble : unmarkScanItemsTrouble;
+    const r = unwrapResult(
+      await api({
+        exes: [exe],
+        scan_path: game.start_dir || '',
+        mark,
+      })
+    );
+    if (r?.success === false) {
+      toast(mark ? '标记失败' : '取消标记失败', r?.message || '失败');
+      return;
+    }
+    toast(mark ? '已标记 -trouble' : '已取消 -trouble', r?.message || '完成');
+  } catch (e) {
+    toast(mark ? '标记失败' : '取消标记失败', String(e));
+  }
+}
+
 async function runCleanupFlow(appid: number, opt: DeleteOption, titleHint?: string) {
   const game = await resolveGame(appid, titleHint);
   if (!game) {
@@ -257,11 +385,14 @@ async function runCleanupFlow(appid: number, opt: DeleteOption, titleHint?: stri
 
   let preview: string[] = [];
   let normInfo = '';
+  let warnText = '';
   try {
     const r = unwrapResult(await previewDelete(args));
     preview = (r && r.existing) || [];
     if (r) {
       normInfo = `\n(解析路径 exe=${r.normalized_exe || '?'} start=${r.normalized_start || '?'})`;
+      const warns = Array.isArray(r.warnings) ? r.warnings.filter(Boolean) : [];
+      if (warns.length) warnText = `\n\n注意：\n- ${warns.join('\n- ')}`;
     }
   } catch (e) {
     LOG('preview failed', e);
@@ -275,7 +406,7 @@ async function runCleanupFlow(appid: number, opt: DeleteOption, titleHint?: stri
 
   showConfirmModal({
     title: `${opt.label}：${game.name || titleHint || game.appid}`,
-    body: `将删除：\n${lines}\n\n此操作不可恢复！`,
+    body: `将删除：\n${lines}${warnText}\n\n此操作不可恢复！`,
     onConfirm: async () => {
       try {
         const r = unwrapResult(await deleteNonSteamGame(args));
@@ -309,9 +440,65 @@ async function runCleanupFlow(appid: number, opt: DeleteOption, titleHint?: stri
 // ---------------------------------------------------------------------------
 // 库详情页组件：注入到 /library/app/:appid
 // ---------------------------------------------------------------------------
+/** 截图输出最长边预设：0=原图 */
+const SCREENSHOT_SIZE_PRESETS: { label: string; value: number }[] = [
+  { label: '256', value: 256 },
+  { label: '512', value: 512 },
+  { label: '768', value: 768 },
+  { label: '1024', value: 1024 },
+  { label: '原图', value: 0 },
+];
+
+async function runSetIconFromScreenshot(
+  appId: number,
+  mode: 'capture' | 'latest' | 'capture_or_latest',
+  titleHint?: string,
+  maxEdge?: number
+) {
+  const game = await resolveGame(appId, titleHint);
+  if (!game) {
+    toast('设为图标', '未找到该非 Steam 游戏');
+    return;
+  }
+  const edge = typeof maxEdge === 'number' ? maxEdge : 768;
+  const sizeTxt = edge <= 0 ? '原图' : `${edge}px`;
+  try {
+    toast(
+      '设为图标',
+      mode === 'capture'
+        ? `正在截屏（${sizeTxt}）…`
+        : mode === 'latest'
+          ? `正在查找最新截图（${sizeTxt}）…`
+          : `正在截屏（失败则用最新截图，${sizeTxt}）…`
+    );
+    const r = unwrapResult(
+      await setIconFromScreenshot({
+        appid: appId,
+        userdata_id: game.userdata_id || '',
+        name: game.name || titleHint || '',
+        key: game.key || '',
+        mode,
+        delay_ms: mode === 'latest' ? 0 : 500,
+        max_edge: edge,
+        screenshot_max_edge: edge,
+      })
+    );
+    if (r?.success) {
+      toast('图标已更新', r.message || '已写入库图标，请退出 Steam 再打开刷新');
+    } else {
+      toast('设为图标失败', r?.message || '未知错误');
+    }
+  } catch (e) {
+    toast('设为图标失败', String(e));
+  }
+}
+
 function GameCleanupPanel({ appId, title }: { appId: number; title?: string }) {
   const [known, setKnown] = React.useState<boolean | null>(null);
   const [gameName, setGameName] = React.useState(title || '');
+  const [iconBusy, setIconBusy] = React.useState(false);
+  const [shotSize, setShotSize] = React.useState(768);
+  const [cjkLang, setCjkLang] = React.useState('zh_CN');
 
   React.useEffect(() => {
     let cancelled = false;
@@ -323,6 +510,15 @@ function GameCleanupPanel({ appId, title }: { appId: number; title?: string }) {
         setGameName(g.name || title || '');
       } else {
         setKnown(false);
+      }
+      try {
+        const s = unwrapResult(await getScanSettings({})) || {};
+        if (s && (s.screenshot_max_edge === 0 || s.screenshot_max_edge)) {
+          const v = Number(s.screenshot_max_edge);
+          if (!Number.isNaN(v)) setShotSize(v);
+        }
+      } catch {
+        /* ignore */
       }
     })();
     return () => {
@@ -354,6 +550,56 @@ function GameCleanupPanel({ appId, title }: { appId: number; title?: string }) {
   const PanelSectionRow =
     DFL.PanelSectionRow || ((p: any) => React.createElement('div', { style: { marginBottom: 6 } }, p.children));
 
+  const pickSize = (v: number) => {
+    setShotSize(v);
+    // 记住选择（后台保存，不挡操作）
+    void setScanSettings({ screenshot_max_edge: v }).catch(() => undefined);
+  };
+
+  const iconBtn = (label: string, mode: 'capture' | 'latest' | 'capture_or_latest') =>
+    ButtonItem
+      ? React.createElement(
+          ButtonItem,
+          {
+            layout: 'below',
+            disabled: iconBusy,
+            onClick: () => {
+              if (iconBusy) return;
+              setIconBusy(true);
+              void runSetIconFromScreenshot(appId, mode, gameName, shotSize).finally(() =>
+                setIconBusy(false)
+              );
+            },
+          },
+          iconBusy ? '处理中…' : label
+        )
+      : React.createElement(
+          'button',
+          {
+            disabled: iconBusy,
+            onClick: () => {
+              if (iconBusy) return;
+              setIconBusy(true);
+              void runSetIconFromScreenshot(appId, mode, gameName, shotSize).finally(() =>
+                setIconBusy(false)
+              );
+            },
+            style: {
+              width: '100%',
+              padding: '10px',
+              background: '#1a6faf',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 4,
+              marginBottom: 6,
+              opacity: iconBusy ? 0.6 : 1,
+            },
+          },
+          iconBusy ? '处理中…' : label
+        );
+
+  const sizeLabel = shotSize <= 0 ? '原图' : `${shotSize}px`;
+
   return React.createElement(
     'div',
     {
@@ -362,6 +608,72 @@ function GameCleanupPanel({ appId, title }: { appId: number; title?: string }) {
         padding: '4px 0',
       },
     },
+    React.createElement(
+      PanelSection,
+      { title: '截图设为图标' },
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.45, marginBottom: 6 } },
+          `把当前画面或 Steam 截图，设为「${gameName || appId}」的库图标/封面。`,
+          React.createElement('br'),
+          '游戏中可先按 Steam+R1（或 F12）截图，再点「用最新截图」；也可直接「立即截屏」。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, marginBottom: 6 } },
+          `输出尺寸（最长边，当前：${sizeLabel}）`
+        ),
+        React.createElement(
+          'div',
+          {
+            style: {
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: 6,
+            },
+          },
+          ...SCREENSHOT_SIZE_PRESETS.map((p) =>
+            React.createElement(
+              'button',
+              {
+                key: String(p.value),
+                disabled: iconBusy,
+                onClick: () => pickSize(p.value),
+                style: {
+                  padding: '8px 12px',
+                  borderRadius: 6,
+                  border: 'none',
+                  fontSize: 13,
+                  fontWeight: shotSize === p.value ? 700 : 500,
+                  background: shotSize === p.value ? '#1a9fff' : 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                  opacity: iconBusy ? 0.6 : 1,
+                },
+              },
+              p.label
+            )
+          )
+        )
+      ),
+      React.createElement(PanelSectionRow, { key: 'nsc-icon-capture' }, iconBtn('立即截屏并设为图标', 'capture')),
+      React.createElement(
+        PanelSectionRow,
+        { key: 'nsc-icon-latest' },
+        iconBtn('用最新截图设为图标', 'latest')
+      ),
+      React.createElement(
+        PanelSectionRow,
+        { key: 'nsc-icon-auto' },
+        iconBtn('截屏（失败则用最新截图）', 'capture_or_latest')
+      )
+    ),
     React.createElement(
       PanelSection,
       { title: '非 Steam 游戏清理' },
@@ -403,6 +715,132 @@ function GameCleanupPanel({ appId, title }: { appId: number; title?: string }) {
                 opt.label
               )
         )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.45, margin: '10px 0 4px' } },
+          '有问题但不必删除时：给游戏文件夹加「-trouble」标记（重命名，不删文件）。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        { key: 'nsc-mark-trouble' },
+        ButtonItem
+          ? React.createElement(
+              ButtonItem,
+              {
+                layout: 'below',
+                onClick: () => void runMarkTroubleFlow(appId, true, gameName),
+              },
+              '标记文件夹为 -trouble（不删除）'
+            )
+          : React.createElement(
+              'button',
+              {
+                onClick: () => void runMarkTroubleFlow(appId, true, gameName),
+                style: {
+                  width: '100%',
+                  padding: '10px',
+                  background: '#a65c00',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 4,
+                  marginBottom: 6,
+                },
+              },
+              '标记文件夹为 -trouble（不删除）'
+            )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        { key: 'nsc-unmark-trouble' },
+        ButtonItem
+          ? React.createElement(
+              ButtonItem,
+              {
+                layout: 'below',
+                onClick: () => void runMarkTroubleFlow(appId, false, gameName),
+              },
+              '取消 -trouble 标记'
+            )
+          : React.createElement(
+              'button',
+              {
+                onClick: () => void runMarkTroubleFlow(appId, false, gameName),
+                style: {
+                  width: '100%',
+                  padding: '10px',
+                  background: '#555',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 4,
+                  marginBottom: 6,
+                },
+              },
+              '取消 -trouble 标记'
+            )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.85, margin: '8px 0 4px' } },
+          '文字变成 ?? 时，先选语言再修复汉化字体：'
+        ),
+        React.createElement(
+          'div',
+          { style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 } },
+          ...CJK_LANG_OPTIONS.map((opt) =>
+            React.createElement(
+              'button',
+              {
+                key: 'nsc-cjk-' + opt.id,
+                onClick: () => setCjkLang(opt.id),
+                style: {
+                  padding: '8px 10px',
+                  borderRadius: 4,
+                  border: cjkLang === opt.id ? '1px solid #1a9fff' : '1px solid #456',
+                  background: cjkLang === opt.id ? '#1a9fff' : '#1b2838',
+                  color: '#fff',
+                  fontSize: 13,
+                },
+              },
+              opt.label
+            )
+          )
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        { key: 'nsc-cjk-repair' },
+        ButtonItem
+          ? React.createElement(
+              ButtonItem,
+              {
+                layout: 'below',
+                onClick: () => void runRepairCjkFontsFlow(appId, cjkLang, gameName),
+              },
+              '修复汉化字体'
+            )
+          : React.createElement(
+              'button',
+              {
+                onClick: () => void runRepairCjkFontsFlow(appId, cjkLang, gameName),
+                style: {
+                  width: '100%',
+                  padding: '10px',
+                  background: '#1a9fff',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 4,
+                },
+              },
+              '修复汉化字体'
+            )
       )
     )
   );
@@ -619,6 +1057,49 @@ function injectMenuItems(menuItems: any[], appId: number) {
     )
   );
 
+  // 有问题但不删除：-trouble 文件夹标记
+  newItems.push(
+    React.createElement(
+      MenuItem,
+      {
+        key: 'nsc-clean:mark-trouble',
+        onSelected: () => {
+          void runMarkTroubleFlow(appId, true);
+        },
+      },
+      '标记文件夹 -trouble（不删除）'
+    ) as any
+  );
+  newItems.push(
+    React.createElement(
+      MenuItem,
+      {
+        key: 'nsc-clean:unmark-trouble',
+        onSelected: () => {
+          void runMarkTroubleFlow(appId, false);
+        },
+      },
+      '取消 -trouble 标记'
+    ) as any
+  );
+
+  // 修复汉化字体（非破坏性，按语言分项）
+  for (const lang of CJK_LANG_OPTIONS) {
+    newItems.push(
+      React.createElement(
+        MenuItem,
+        {
+          key: 'nsc-clean:cjk-fonts:' + lang.id,
+          tone: 'emphasis',
+          onSelected: () => {
+            void runRepairCjkFontsFlow(appId, lang.id);
+          },
+        },
+        '修复汉化字体：' + lang.label
+      ) as any
+    );
+  }
+
   // 插在「属性」前面
   let insertAt = menuItems.findIndex((item) => {
     return Boolean(
@@ -788,7 +1269,71 @@ interface ScanCandidate {
   score: number;
   already_added: boolean;
   hidden?: boolean;
+  /** 文件夹名带 -trouble，表示有问题但不必删除 */
+  trouble?: boolean;
+  game_folder?: string;
+  icon?: string;
+  has_icon?: boolean;
+  /** data:image/...;base64,... 供列表直接显示 */
+  icon_data_url?: string;
   rel_dir: string;
+}
+
+function GameIconThumb({ src, size = 40 }: { src?: string; size?: number }) {
+  const box: any = {
+    width: size,
+    height: size,
+    flex: '0 0 auto',
+    borderRadius: 6,
+    background: 'rgba(255,255,255,0.08)',
+    border: '1px solid rgba(255,255,255,0.12)',
+    overflow: 'hidden',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  };
+  if (src) {
+    return React.createElement(
+      'div',
+      { style: box },
+      React.createElement('img', {
+        src,
+        alt: '',
+        draggable: false,
+        style: {
+          width: '100%',
+          height: '100%',
+          objectFit: 'contain',
+          imageRendering: 'auto',
+        },
+        onError: (e: any) => {
+          // 加载失败时显示占位
+          try {
+            e.target.style.display = 'none';
+            if (e.target.parentElement) {
+              e.target.parentElement.textContent = '∅';
+              e.target.parentElement.style.fontSize = '14px';
+              e.target.parentElement.style.opacity = '0.45';
+            }
+          } catch {
+            /* ignore */
+          }
+        },
+      })
+    );
+  }
+  return React.createElement(
+    'div',
+    {
+      style: {
+        ...box,
+        fontSize: 12,
+        opacity: 0.4,
+        color: '#fff',
+      },
+    },
+    '∅'
+  );
 }
 
 function formatSize(n: number): string {
@@ -868,6 +1413,7 @@ function PluginPanelInner() {
   const [selected, setSelected] = React.useState<Record<string, boolean>>({});
   const [hideAdded, setHideAdded] = React.useState(true);
   const [autoExtract, setAutoExtract] = React.useState(true);
+  const [extractDepth, setExtractDepth] = React.useState(2);
   const [showHiddenBar, setShowHiddenBar] = React.useState(false);
   const [pathDraft, setPathDraft] = React.useState('/home/deck/Downloads');
   const [picking, setPicking] = React.useState(false);
@@ -879,6 +1425,125 @@ function PluginPanelInner() {
   const [missingLoading, setMissingLoading] = React.useState(false);
   const [missingSelected, setMissingSelected] = React.useState<Record<string, boolean>>({});
   const [purging, setPurging] = React.useState(false);
+
+  // 修复汉化字体
+  const [cjkLang, setCjkLang] = React.useState('zh_CN');
+  const [cjkRepairing, setCjkRepairing] = React.useState(false);
+  const [cjkStatus, setCjkStatus] = React.useState('');
+
+  // 左侧插件：截图设为图标
+  const [iconLibGames, setIconLibGames] = React.useState<NonSteamGame[]>([]);
+  const [iconTargetAppid, setIconTargetAppid] = React.useState<number>(0);
+  const [iconRunningMsg, setIconRunningMsg] = React.useState('');
+  const [iconShotSize, setIconShotSize] = React.useState(768);
+  const [iconBusy, setIconBusy] = React.useState(false);
+  const [iconStatus, setIconStatus] = React.useState('');
+  const [iconListLoading, setIconListLoading] = React.useState(false);
+
+  const [steamRunning, setSteamRunning] = React.useState(false);
+  const [libGames, setLibGames] = React.useState<NonSteamGame[]>([]);
+  const [libTarget, setLibTarget] = React.useState(0);
+  const [dupGroups, setDupGroups] = React.useState<any[]>([]);
+  const [dupStatus, setDupStatus] = React.useState('');
+  const [dupBusy, setDupBusy] = React.useState(false);
+
+  const refreshIconTargets = React.useCallback(async () => {
+    setIconListLoading(true);
+    try {
+      const r = unwrapResult(await listNonsteamForIcon({})) || {};
+      const list: NonSteamGame[] = (r.games || []) as NonSteamGame[];
+      setIconLibGames(list);
+      if (r.screenshot_max_edge === 0 || r.screenshot_max_edge) {
+        const v = Number(r.screenshot_max_edge);
+        if (!Number.isNaN(v)) setIconShotSize(v);
+      }
+      const running = r.running || {};
+      if (running.running && running.game) {
+        const aid = Number(running.game.appid || running.appid || 0);
+        setIconTargetAppid(aid);
+        setIconRunningMsg(running.message || `正在运行：${running.game.name || aid}`);
+      } else {
+        setIconRunningMsg(running.message || '未检测到正在运行的非 Steam 游戏');
+        // 若当前选择为空，默认选第一项
+        setIconTargetAppid((prev) => {
+          if (prev && list.some((g) => Number(g.appid) === prev)) return prev;
+          return list.length ? Number(list[0].appid) : 0;
+        });
+      }
+    } catch (e) {
+      setIconRunningMsg('加载游戏列表失败: ' + String(e));
+    } finally {
+      setIconListLoading(false);
+    }
+  }, []);
+
+  const refreshLibAndStatus = React.useCallback(async () => {
+    try {
+      const st = unwrapResult(await getPluginStatus({})) || {};
+      setSteamRunning(!!st.steam_running);
+    } catch {
+      /* ignore */
+    }
+    try {
+      const list = unwrapResult(await getNonSteamGames());
+      const arr: NonSteamGame[] = Array.isArray(list) ? list : [];
+      setLibGames(arr);
+      setLibTarget((prev) => {
+        if (prev && arr.some((g) => Number(g.appid) === prev)) return prev;
+        return arr.length ? Number(arr[0].appid) : 0;
+      });
+    } catch (e) {
+      LOG('list lib games', e);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refreshIconTargets();
+    void refreshLibAndStatus();
+  }, [refreshIconTargets, refreshLibAndStatus]);
+
+  const doPanelSetIcon = async (mode: 'capture' | 'latest' | 'capture_or_latest') => {
+    if (!iconTargetAppid) {
+      toast('设为图标', '请先选择一个非 Steam 游戏');
+      return;
+    }
+    const g =
+      iconLibGames.find((x) => Number(x.appid) === Number(iconTargetAppid)) || null;
+    setIconBusy(true);
+    const sizeTxt = iconShotSize <= 0 ? '原图' : `${iconShotSize}px`;
+    setIconStatus(
+      mode === 'capture'
+        ? `正在截屏（${sizeTxt}）…`
+        : mode === 'latest'
+          ? `正在用最新截图（${sizeTxt}）…`
+          : `截屏中，失败则用最新截图（${sizeTxt}）…`
+    );
+    try {
+      const r = unwrapResult(
+        await setIconFromScreenshot({
+          appid: iconTargetAppid,
+          userdata_id: g?.userdata_id || '',
+          name: g?.name || '',
+          key: g?.key || '',
+          mode,
+          delay_ms: mode === 'latest' ? 0 : 400,
+          max_edge: iconShotSize,
+          screenshot_max_edge: iconShotSize,
+        })
+      );
+      setIconStatus(r?.message || '');
+      if (r?.success) {
+        toast('图标已更新', r.message || '完成');
+      } else {
+        toast('设为图标失败', r?.message || '未知错误');
+      }
+    } catch (e) {
+      setIconStatus(String(e));
+      toast('设为图标失败', String(e));
+    } finally {
+      setIconBusy(false);
+    }
+  };
 
   const applyPathSafe = React.useCallback((p: string) => {
     const next = String(p || '').trim() || '/home/deck/Downloads';
@@ -905,6 +1570,7 @@ function PluginPanelInner() {
         }
         if (s.max_depth) setMaxDepth(Number(s.max_depth) || 5);
         if (typeof s.auto_extract === 'boolean') setAutoExtract(s.auto_extract);
+        if (s.extract_depth || s.extract_depth === 0) setExtractDepth(Number(s.extract_depth) || 0);
       } catch (e) {
         LOG('get_scan_settings', e);
       }
@@ -941,6 +1607,7 @@ function PluginPanelInner() {
           scan_path: p,
           max_depth: maxDepth,
           auto_extract: autoExtract,
+          extract_depth: extractDepth,
         })
       );
       const saved = s?.scan_path || p;
@@ -963,6 +1630,7 @@ function PluginPanelInner() {
           scan_path: pathDraft || scanPath,
           max_depth: maxDepth,
           auto_extract: autoExtract,
+          extract_depth: extractDepth,
         });
       } catch {
         /* ignore */
@@ -972,6 +1640,7 @@ function PluginPanelInner() {
           scan_path: pathDraft || scanPath,
           max_depth: maxDepth,
           auto_extract: autoExtract,
+          extract_depth: extractDepth,
           include_hidden: false,
         })
       );
@@ -989,9 +1658,10 @@ function PluginPanelInner() {
           `解压：新${ex.extracted_count || 0} / 已存在跳过${ex.skipped_existing || 0} / 失败${ex.failed_count || 0}`
         );
       }
+      // 默认勾选高分且未添加；-trouble 问题项不自动勾选
       const sel: Record<string, boolean> = {};
       for (const g of list) {
-        if (!g.already_added && g.score >= 40) sel[g.exe] = true;
+        if (!g.already_added && !g.trouble && g.score >= 40) sel[g.exe] = true;
       }
       setSelected(sel);
       setStatus(r?.message || `扫描到 ${list.length} 个`);
@@ -1066,6 +1736,7 @@ function PluginPanelInner() {
         name: g.name,
         exe: g.exe,
         start_dir: g.start_dir,
+        icon: g.icon || '',
       }));
     if (!entries.length) {
       toast('添加游戏', '请先勾选要添加的游戏');
@@ -1078,6 +1749,7 @@ function PluginPanelInner() {
       setStatus(r?.message || '');
       toast('添加结果', r?.message || JSON.stringify(r));
       await doScan();
+      await refreshLibAndStatus();
     } catch (e) {
       toast('添加失败', String(e));
       setStatus('添加失败: ' + String(e));
@@ -1180,9 +1852,290 @@ function PluginPanelInner() {
     borderRadius: 4,
   });
 
+  const iconSizeLabel = iconShotSize <= 0 ? '原图' : `${iconShotSize}px`;
+  const selectedIconGame =
+    iconLibGames.find((g) => Number(g.appid) === Number(iconTargetAppid)) || null;
+
+  const selectedLibGame =
+    libGames.find((g) => Number(g.appid) === Number(libTarget)) || null;
+
   return React.createElement(
     'div',
     { style: { padding: '0 0 16px 0' } },
+    steamRunning
+      ? React.createElement(
+          PanelSection,
+          { title: '提示' },
+          React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement(
+              'div',
+              {
+                style: {
+                  fontSize: 12,
+                  lineHeight: 1.45,
+                  padding: '8px 10px',
+                  borderRadius: 6,
+                  background: 'rgba(255,170,40,0.18)',
+                },
+              },
+              'Steam 正在运行。添加/删除/改图标后请完全退出 Steam 再打开，否则库列表可能被缓存盖回。'
+            )
+          )
+        )
+      : null,
+    // -------- 已入库游戏：注入失败时的备用清理入口 --------
+    React.createElement(
+      PanelSection,
+      { title: `已入库非 Steam（${libGames.length}）` },
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.4 } },
+          '库详情页进不去时，可在这里清理或修字体。改完后请完全退出 Steam。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'select',
+          {
+            value: String(libTarget || ''),
+            disabled: !libGames.length,
+            onChange: (e: any) => setLibTarget(Number(e.target.value) || 0),
+            style: {
+              width: '100%',
+              padding: '10px 8px',
+              borderRadius: 6,
+              border: '1px solid rgba(255,255,255,0.2)',
+              background: 'rgba(0,0,0,0.35)',
+              color: '#fff',
+              fontSize: 13,
+            },
+          },
+          libGames.length
+            ? libGames.map((g) =>
+                React.createElement(
+                  'option',
+                  { key: String(g.appid) + ':' + String(g.key), value: String(g.appid) },
+                  `${g.name || '(未命名)'}  (${g.appid})`
+                )
+              )
+            : React.createElement('option', { value: '' }, '库中暂无非 Steam 游戏')
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+          ...OPTIONS.map((opt) =>
+            React.createElement(
+              'button',
+              {
+                key: 'lib-clean-' + opt.id,
+                style: { ...btnStyle(), background: libTarget ? '#a33' : '#444' },
+                disabled: !libTarget,
+                onClick: () => void runCleanupFlow(libTarget, opt, selectedLibGame?.name),
+              },
+              opt.label
+            )
+          ),
+          React.createElement(
+            'button',
+            {
+              style: btnStyle(true),
+              disabled: !libTarget,
+              onClick: () => void runRepairCjkFontsFlow(libTarget, cjkLang, selectedLibGame?.name),
+            },
+            `修复汉化字体（${CJK_LANG_OPTIONS.find((x) => x.id === cjkLang)?.label || cjkLang}）`
+          ),
+          React.createElement(
+            'button',
+            {
+              style: btnStyle(),
+              onClick: () => void refreshLibAndStatus(),
+            },
+            '刷新已入库列表'
+          )
+        )
+      )
+    ),
+    // -------- 截图设为图标（左侧插件主入口，游戏中可开 QAM 使用）--------
+    React.createElement(
+      PanelSection,
+      { title: '截图设为图标' },
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.92, lineHeight: 1.45 } },
+          '在游戏运行时打开左侧 Decky 插件，即可截屏并设为该游戏的库图标/封面。',
+          React.createElement('br'),
+          '若直接截屏失败：先按 Steam+R1（或 F12）截一张，再点「用最新截图」。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          {
+            style: {
+              fontSize: 12,
+              padding: '8px 10px',
+              borderRadius: 6,
+              background: iconRunningMsg.includes('正在运行')
+                ? 'rgba(26,159,255,0.18)'
+                : 'rgba(255,255,255,0.06)',
+              lineHeight: 1.4,
+            },
+          },
+          iconListLoading ? '正在检测当前游戏…' : iconRunningMsg || '—'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, marginBottom: 6 } },
+          '目标游戏',
+          selectedIconGame
+            ? `：${selectedIconGame.name || selectedIconGame.appid}`
+            : iconLibGames.length
+              ? ''
+              : '（库中暂无非 Steam 游戏）'
+        ),
+        React.createElement(
+          'select',
+          {
+            value: String(iconTargetAppid || ''),
+            disabled: iconBusy || !iconLibGames.length,
+            onChange: (e: any) => setIconTargetAppid(Number(e.target.value) || 0),
+            style: {
+              width: '100%',
+              padding: '10px 8px',
+              borderRadius: 6,
+              border: '1px solid rgba(255,255,255,0.2)',
+              background: 'rgba(0,0,0,0.35)',
+              color: '#fff',
+              fontSize: 13,
+            },
+          },
+          iconLibGames.length
+            ? iconLibGames.map((g) =>
+                React.createElement(
+                  'option',
+                  { key: String(g.appid) + ':' + String(g.key), value: String(g.appid) },
+                  `${g.name || '(未命名)'}  (${g.appid})`
+                )
+              )
+            : React.createElement('option', { value: '' }, '暂无非 Steam 游戏')
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, marginBottom: 6 } },
+          `输出尺寸（最长边，当前：${iconSizeLabel}）`
+        ),
+        React.createElement(
+          'div',
+          { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
+          ...SCREENSHOT_SIZE_PRESETS.map((p) =>
+            React.createElement(
+              'button',
+              {
+                key: 'panel-sz-' + p.value,
+                disabled: iconBusy,
+                onClick: () => {
+                  setIconShotSize(p.value);
+                  void setScanSettings({ screenshot_max_edge: p.value }).catch(() => undefined);
+                },
+                style: {
+                  padding: '8px 12px',
+                  borderRadius: 6,
+                  border: 'none',
+                  fontSize: 13,
+                  fontWeight: iconShotSize === p.value ? 700 : 500,
+                  background: iconShotSize === p.value ? '#1a9fff' : 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                  opacity: iconBusy ? 0.6 : 1,
+                },
+              },
+              p.label
+            )
+          )
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+          React.createElement(
+            'button',
+            {
+              style: {
+                ...btnStyle(true),
+                background: iconBusy || !iconTargetAppid ? '#444' : '#1a6faf',
+              },
+              disabled: iconBusy || !iconTargetAppid,
+              onClick: () => void doPanelSetIcon('capture'),
+            },
+            iconBusy ? '处理中…' : '立即截屏并设为图标'
+          ),
+          React.createElement(
+            'button',
+            {
+              style: btnStyle(true),
+              disabled: iconBusy || !iconTargetAppid,
+              onClick: () => void doPanelSetIcon('latest'),
+            },
+            '用最新截图设为图标'
+          ),
+          React.createElement(
+            'button',
+            {
+              style: btnStyle(),
+              disabled: iconBusy || !iconTargetAppid,
+              onClick: () => void doPanelSetIcon('capture_or_latest'),
+            },
+            '截屏（失败则用最新截图）'
+          ),
+          React.createElement(
+            'button',
+            {
+              style: btnStyle(),
+              disabled: iconBusy || iconListLoading,
+              onClick: () => void refreshIconTargets(),
+            },
+            iconListLoading ? '刷新中…' : '刷新游戏列表 / 检测运行中'
+          )
+        )
+      ),
+      iconStatus
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement(
+              'div',
+              { style: { fontSize: 12, opacity: 0.85, wordBreak: 'break-all' } },
+              iconStatus
+            )
+          )
+        : null
+    ),
     // -------- 失效清理 --------
     React.createElement(
       PanelSection,
@@ -1458,6 +2411,79 @@ function PluginPanelInner() {
         PanelSectionRow,
         null,
         React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, marginBottom: 6 } },
+          `扫描深度（当前：${maxDepth} 层）`
+        ),
+        React.createElement(
+          'div',
+          { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
+          ...[2, 3, 4, 5, 6, 8].map((d) =>
+            React.createElement(
+              'button',
+              {
+                key: 'depth-' + d,
+                disabled: loading,
+                onClick: () => {
+                  setMaxDepth(d);
+                  void setScanSettings({ max_depth: d }).catch(() => undefined);
+                },
+                style: {
+                  padding: '8px 12px',
+                  borderRadius: 6,
+                  border: 'none',
+                  fontSize: 13,
+                  fontWeight: maxDepth === d ? 700 : 500,
+                  background: maxDepth === d ? '#1a9fff' : 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                },
+              },
+              String(d)
+            )
+          )
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, marginBottom: 6 } },
+          `解压嵌套层数（当前：${extractDepth}）`
+        ),
+        React.createElement(
+          'div',
+          { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
+          ...[0, 1, 2, 3].map((d) =>
+            React.createElement(
+              'button',
+              {
+                key: 'extdepth-' + d,
+                disabled: loading || !autoExtract,
+                onClick: () => {
+                  setExtractDepth(d);
+                  void setScanSettings({ extract_depth: d }).catch(() => undefined);
+                },
+                style: {
+                  padding: '8px 12px',
+                  borderRadius: 6,
+                  border: 'none',
+                  fontSize: 13,
+                  fontWeight: extractDepth === d ? 700 : 500,
+                  background: extractDepth === d ? '#1a9fff' : 'rgba(255,255,255,0.12)',
+                  color: '#fff',
+                  opacity: autoExtract ? 1 : 0.5,
+                },
+              },
+              d === 0 ? '不嵌套' : String(d)
+            )
+          )
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
           'label',
           { style: { fontSize: 13, display: 'flex', alignItems: 'center', gap: 8 } },
           React.createElement('input', {
@@ -1528,6 +2554,7 @@ function PluginPanelInner() {
                 padding: '8px 4px',
                 borderBottom: '1px solid rgba(255,255,255,0.08)',
                 opacity: g.already_added ? 0.55 : 1,
+                background: g.trouble ? 'rgba(180,90,0,0.12)' : undefined,
               },
               onClick: () => !g.already_added && toggleOne(g.exe),
             },
@@ -1540,7 +2567,11 @@ function PluginPanelInner() {
                 toggleOne(g.exe, !!e.target.checked);
               },
               onClick: (e: any) => e.stopPropagation?.(),
-              style: { marginTop: 4, width: 18, height: 18 },
+              style: { marginTop: 10, width: 18, height: 18 },
+            }),
+            React.createElement(GameIconThumb, {
+              src: g.icon_data_url || '',
+              size: 44,
             }),
             React.createElement(
               'div',
@@ -1549,6 +2580,20 @@ function PluginPanelInner() {
                 'div',
                 { style: { fontWeight: 600, fontSize: 14 } },
                 g.name,
+                g.trouble
+                  ? React.createElement(
+                      'span',
+                      {
+                        style: {
+                          marginLeft: 8,
+                          fontSize: 11,
+                          color: '#ffb347',
+                          fontWeight: 700,
+                        },
+                      },
+                      '有问题'
+                    )
+                  : null,
                 g.already_added
                   ? React.createElement(
                       'span',
@@ -1654,7 +2699,11 @@ function PluginPanelInner() {
                     type: 'checkbox',
                     checked: !!selected[g.exe],
                     onChange: (e: any) => toggleOne(g.exe, !!e.target.checked),
-                    style: { marginTop: 4, width: 18, height: 18 },
+                    style: { marginTop: 10, width: 18, height: 18 },
+                  }),
+                  React.createElement(GameIconThumb, {
+                    src: g.icon_data_url || '',
+                    size: 40,
                   }),
                   React.createElement(
                     'div',
@@ -1720,6 +2769,313 @@ function PluginPanelInner() {
     ),
     React.createElement(
       PanelSection,
+      { title: '库图标' },
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.4 } },
+          '新添加的非 Steam 游戏会自动写入 Steam 库图标（grid 的 _icon / 封面）。',
+          React.createElement('br'),
+          '若以前添加的没有图标，可点下方按钮批量从 exe/目录补图标。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: btnStyle(true),
+            onClick: () => {
+              void (async () => {
+                try {
+                  toast('库图标', '正在为已有非 Steam 游戏补图标…');
+                  const r = unwrapResult(await repairNonsteamIcons({}));
+                  toast('库图标', r?.message || '完成');
+                } catch (e) {
+                  toast('库图标', String(e));
+                }
+              })();
+            },
+          },
+          '为已添加的游戏补写库图标'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: btnStyle(),
+            onClick: () => {
+              void (async () => {
+                try {
+                  toast('详情页标题', '正在清除误写的 logo…');
+                  const r = unwrapResult(await fixGamePageTitles({}));
+                  toast('详情页标题', r?.message || '完成');
+                } catch (e) {
+                  toast('详情页标题', String(e));
+                }
+              })();
+            },
+          },
+          '恢复详情页文字标题（删误写 logo）'
+        )
+      )
+    ),
+    // -------- 重复快捷方式 --------
+    React.createElement(
+      PanelSection,
+      { title: '重复快捷方式' },
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.4 } },
+          '同一 exe 被加进库多次时，可只留一条快捷方式（不删游戏文件）。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: btnStyle(true),
+            disabled: dupBusy,
+            onClick: () => {
+              void (async () => {
+                setDupBusy(true);
+                try {
+                  const r = unwrapResult(await findDuplicateNonsteamGames({}));
+                  setDupGroups(r?.groups || []);
+                  setDupStatus(r?.message || '');
+                  toast('重复检测', r?.message || '完成');
+                } catch (e) {
+                  setDupStatus(String(e));
+                  toast('重复检测', String(e));
+                } finally {
+                  setDupBusy(false);
+                }
+              })();
+            },
+          },
+          dupBusy ? '检测中…' : '检测重复快捷方式'
+        )
+      ),
+      dupStatus
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement('div', { style: { fontSize: 12, color: '#9cf' } }, dupStatus)
+          )
+        : null,
+      ...dupGroups.slice(0, 12).map((grp: any, i: number) =>
+        React.createElement(
+          PanelSectionRow,
+          { key: 'dup-' + i },
+          React.createElement(
+            'div',
+            { style: { fontSize: 12, lineHeight: 1.4 } },
+            React.createElement(
+              'div',
+              { style: { fontWeight: 600 } },
+              `${grp.reason === 'same_exe' ? '同启动器' : '同名'}：${grp.label || ''}`
+            ),
+            React.createElement(
+              'div',
+              { style: { opacity: 0.75, wordBreak: 'break-all' } },
+              (grp.games || [])
+                .map((g: any) => `${g.name || '?'} (${g.appid})`)
+                .join(' / ')
+            )
+          )
+        )
+      ),
+      dupGroups.some((g: any) => g.reason === 'same_exe')
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement(
+              'button',
+              {
+                style: { ...btnStyle(), background: '#a33' },
+                disabled: dupBusy,
+                onClick: () => {
+                  showConfirmModalSoft({
+                    title: '移除重复快捷方式',
+                    okText: '只留一条',
+                    body: '每组相同 exe 只保留一条库快捷方式，不会删除游戏文件。请完全退出 Steam 后再打开。',
+                    onConfirm: async () => {
+                      setDupBusy(true);
+                      try {
+                        const r = unwrapResult(await purgeDuplicateShortcuts({ keep_first: true }));
+                        setDupStatus(r?.message || '');
+                        toast('去重', r?.message || '完成');
+                        const again = unwrapResult(await findDuplicateNonsteamGames({}));
+                        setDupGroups(again?.groups || []);
+                        await refreshLibAndStatus();
+                      } catch (e) {
+                        toast('去重失败', String(e));
+                      } finally {
+                        setDupBusy(false);
+                      }
+                    },
+                  });
+                },
+              },
+              '移除同启动器的重复快捷方式'
+            )
+          )
+        : null
+    ),
+    // -------- 修复汉化字体 --------
+    React.createElement(
+      PanelSection,
+      { title: '修复汉化字体' },
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.45 } },
+          '老汉化 / 日文 Windows 游戏在 Deck 上文字变成 ?? 时使用。',
+          React.createElement('br'),
+          '会写入启动项 LANG，并修补 Proton 前缀代码页与黑体映射。',
+          React.createElement('br'),
+          '也可在单个非 Steam 游戏详情页 / 右键菜单中点「修复汉化字体」。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, marginBottom: 6 } },
+          '目标语言'
+        ),
+        React.createElement(
+          'div',
+          { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+          ...CJK_LANG_OPTIONS.map((opt) =>
+            React.createElement(
+              'button',
+              {
+                key: opt.id,
+                onClick: () => setCjkLang(opt.id),
+                style: {
+                  flex: 1,
+                  minWidth: 90,
+                  padding: '8px 10px',
+                  borderRadius: 4,
+                  border: cjkLang === opt.id ? '1px solid #1a9fff' : '1px solid #456',
+                  background: cjkLang === opt.id ? '#1a9fff' : '#1b2838',
+                  color: '#fff',
+                  fontSize: 13,
+                },
+              },
+              opt.label
+            )
+          )
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: btnStyle(true),
+            disabled: cjkRepairing,
+            onClick: () => {
+              void (async () => {
+                const langLabel =
+                  CJK_LANG_OPTIONS.find((x) => x.id === cjkLang)?.label || cjkLang;
+                showConfirmModalSoft({
+                  title: '批量修复汉化字体',
+                  okText: '开始修复',
+                  body:
+                    `将对库中全部非 Steam 游戏按「${langLabel}」修复：\n` +
+                    `· 启动项 LANG/LC_ALL\n` +
+                    `· 已有 Proton 前缀的区域/代码页/字体\n\n` +
+                    `尚未启动过的游戏只有启动项会生效；建议启动一次后再修一次前缀。\n` +
+                    `完成后请完全退出 Steam 再玩。`,
+                  onConfirm: async () => {
+                    setCjkRepairing(true);
+                    setCjkStatus('正在修复…');
+                    try {
+                      const r = unwrapResult(
+                        await repairCjkFonts({ lang: cjkLang, only_with_prefix: false })
+                      );
+                      setCjkStatus(r?.message || '完成');
+                      toast('修复汉化字体', r?.message || '完成');
+                    } catch (e) {
+                      setCjkStatus('失败: ' + String(e));
+                      toast('修复汉化字体', String(e));
+                    } finally {
+                      setCjkRepairing(false);
+                    }
+                  },
+                });
+              })();
+            },
+          },
+          cjkRepairing ? '修复中…' : '批量修复全部非 Steam 游戏'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: btnStyle(),
+            disabled: cjkRepairing,
+            onClick: () => {
+              void (async () => {
+                const langLabel =
+                  CJK_LANG_OPTIONS.find((x) => x.id === cjkLang)?.label || cjkLang;
+                showConfirmModalSoft({
+                  title: '仅修复已启动过的游戏',
+                  okText: '开始修复',
+                  body: `只处理已有 compatdata 前缀的非 Steam 游戏（语言：${langLabel}）。`,
+                  onConfirm: async () => {
+                    setCjkRepairing(true);
+                    setCjkStatus('正在修复（仅有前缀）…');
+                    try {
+                      const r = unwrapResult(
+                        await repairCjkFonts({ lang: cjkLang, only_with_prefix: true })
+                      );
+                      setCjkStatus(r?.message || '完成');
+                      toast('修复汉化字体', r?.message || '完成');
+                    } catch (e) {
+                      setCjkStatus('失败: ' + String(e));
+                      toast('修复汉化字体', String(e));
+                    } finally {
+                      setCjkRepairing(false);
+                    }
+                  },
+                });
+              })();
+            },
+          },
+          cjkRepairing ? '修复中…' : '仅修复已有 Proton 前缀的'
+        )
+      ),
+      cjkStatus
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement('div', { style: { fontSize: 12, color: '#9cf' } }, cjkStatus)
+          )
+        : null
+    ),
+    React.createElement(
+      PanelSection,
       { title: '清理说明' },
       React.createElement(
         PanelSectionRow,
@@ -1727,11 +3083,13 @@ function PluginPanelInner() {
         React.createElement(
           'div',
           { style: { fontSize: 12, opacity: 0.85, lineHeight: 1.45 } },
-          '游戏仍在磁盘时：打开非 Steam 游戏详情页/菜单可删除本体与存档。',
+          '游戏仍在磁盘时：用上方「已入库非 Steam」，或游戏详情页/右键菜单清理。',
           React.createElement('br'),
-          '文件已删但库里还在：用上方「清理失效非 Steam 游戏」。改完后请完全退出 Steam 再打开。',
+          '文件已删但库里还在：用「清理失效非 Steam 游戏」。同一 exe 加了两次：用「重复快捷方式」。',
           React.createElement('br'),
-          '压缩包：开启自动解压后，会解到同名文件夹再识别启动器（已解压过的会跳过）。'
+          '文字变成 ??：详情页先选语言再修，或用上方批量修复。',
+          React.createElement('br'),
+          '改完后请完全退出 Steam 再打开。压缩包会解到同名文件夹（已解压过的跳过）。'
         )
       )
     )

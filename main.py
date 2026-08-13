@@ -3,13 +3,15 @@ NonSteamCleaner - 彻底清理 Steam 中添加的非 Steam 游戏 (Decky Loader 
 
 功能:
   - 读取所有用户的 shortcuts.vdf，列出已添加的非 Steam 游戏
-  - 提供预览将要删除的文件路径
+  - 提供预览将要删除的文件路径（含 Steam 运行中 / 共用目录警告）
   - 按选项删除:
         1) 本体
         2) 本体 + 存档 (compatdata 前缀，包含 Proton 前缀与存档)
         3) 本体 + 存档 + 着色器缓存
         4) 本体 + 着色器缓存
   - 同时清理 Steam 库中的快捷方式(shortcuts.vdf)以及对应的网格图片
+  - 扫描添加、失效/重复快捷方式、截图设图标
+  - 修复汉化字体：为非 Steam 游戏设置中/日/繁 Proton 区域、黑体映射与 LANG 启动项
 
 注意:
   - 删除操作不可恢复，前端会有二次确认。
@@ -36,6 +38,50 @@ try:
     logger = decky_plugin.logger
 except Exception:  # noqa: BLE001
     logger = logging.getLogger("NonSteamCleaner")
+
+def _load_cjk_font_repair():
+    """加载 cjk_font_repair：同目录 / 数据目录 / 开发目录。"""
+    import importlib.util
+    import sys
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "cjk_font_repair.py"),
+        os.path.expanduser("~/.local/share/decky-loader/plugins/NonSteamCleaner/cjk_font_repair.py"),
+        os.path.expanduser("~/homebrew/data/NonSteamCleaner/cjk_font_repair.py"),
+        os.path.expanduser("~/homebrew/plugins/NonSteamCleaner/cjk_font_repair.py"),
+        os.path.expanduser("~/nonsteam-cleaner/cjk_font_repair.py"),
+        "/home/deck/homebrew/data/NonSteamCleaner/cjk_font_repair.py",
+        "/home/deck/nonsteam-cleaner/cjk_font_repair.py",
+    ]
+    # 也允许已在 sys.path 的常规 import
+    try:
+        import cjk_font_repair as _mod  # type: ignore
+
+        return _mod
+    except Exception:  # noqa: BLE001
+        pass
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("cjk_font_repair", path)
+            if not spec or not spec.loader:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["cjk_font_repair"] = mod
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception as e:  # noqa: BLE001
+            logger.warning("load cjk_font_repair from %s failed: %s", path, e)
+    raise ImportError("cjk_font_repair.py not found")
+
+
+_cjk = _load_cjk_font_repair()
+CJK_LANG_PRESETS = _cjk.CJK_LANG_PRESETS
+repair_cjk_fonts_batch = _cjk.repair_cjk_fonts_batch
+repair_cjk_fonts_for_game = _cjk.repair_cjk_fonts_for_game
+resolve_cjk_preset = _cjk.resolve_cjk_preset
 
 STEAM_ROOTS = [
     os.path.expanduser("~/.steam/steam"),
@@ -435,6 +481,168 @@ def is_nonsteam_shortcut_appid(appid: Any) -> bool:
     return normalize_appid(appid) >= 0x80000000
 
 
+def is_steam_running() -> bool:
+    """Steam 客户端是否在跑（改 shortcuts 后可能被内存缓存盖回）。"""
+    for p in (
+        os.path.expanduser("~/.steampid"),
+        os.path.expanduser("~/.steam/steam.pid"),
+    ):
+        if not os.path.isfile(p):
+            continue
+        try:
+            pid = int(open(p, "r", encoding="utf-8", errors="replace").read().strip())
+        except Exception:  # noqa: BLE001
+            continue
+        if pid > 1 and os.path.exists(f"/proc/{pid}"):
+            return True
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                comm = open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="replace").read().strip()
+            except Exception:  # noqa: BLE001
+                continue
+            if comm in ("steam", "steamwebhelper"):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def list_all_nonsteam_games() -> List[Dict[str, Any]]:
+    """解析所有用户 shortcuts.vdf，列出非 Steam 游戏。"""
+    root = find_steam_root()
+    if not root:
+        return []
+    results: List[Dict[str, Any]] = []
+    userdata = os.path.join(root, "userdata")
+    if not os.path.isdir(userdata):
+        return []
+
+    for sid in sorted(os.listdir(userdata)):
+        sc_path = os.path.join(userdata, sid, "config", "shortcuts.vdf")
+        if not os.path.isfile(sc_path):
+            continue
+        try:
+            with open(sc_path, "rb") as fp:
+                parsed = _read_node(fp)
+        except Exception as e:  # noqa: BLE001
+            logger.error("解析 shortcuts 失败 %s: %s", sc_path, e)
+            continue
+
+        shortcuts = parsed.get("shortcuts", {})
+        if not isinstance(shortcuts, dict):
+            continue
+        for key, entry in shortcuts.items():
+            if not isinstance(entry, dict):
+                continue
+            exe = entry.get("Exe") or ""
+            if not exe:
+                continue
+            name = entry.get("AppName") or ""
+            appid_raw = entry.get("appid")
+            if appid_raw is not None:
+                try:
+                    appid = int(appid_raw)
+                except (TypeError, ValueError):
+                    appid = compute_appid(exe, name)
+            else:
+                appid = compute_appid(exe, name)
+            results.append(
+                {
+                    "appid": normalize_appid(appid),
+                    "name": name,
+                    "exe": exe,
+                    "start_dir": entry.get("StartDir") or "",
+                    "userdata_id": sid,
+                    "key": key,
+                }
+            )
+    return results
+
+
+def start_dir_shared_with_others(start: str, appid: Any) -> List[Dict[str, Any]]:
+    """StartDir 是否被其它快捷方式共用（共用则不能整目录当本体删）。"""
+    start_n = _normalize(start) or ""
+    if not start_n:
+        return []
+    target = normalize_appid(appid)
+    shared: List[Dict[str, Any]] = []
+    start_slash = start_n.rstrip("/") + "/"
+    for g in list_all_nonsteam_games():
+        if normalize_appid(g.get("appid")) == target:
+            continue
+        other_start = _normalize(g.get("start_dir") or "") or ""
+        other_exe = _normalize(g.get("exe") or "") or ""
+        hit = False
+        if other_start and (other_start == start_n or other_start.startswith(start_slash)):
+            hit = True
+        if other_exe and other_exe.startswith(start_slash):
+            hit = True
+        if hit:
+            shared.append(
+                {
+                    "appid": normalize_appid(g.get("appid")),
+                    "name": g.get("name") or "",
+                    "exe": g.get("exe") or "",
+                }
+            )
+    return shared
+
+
+def find_duplicate_nonsteam_groups(games: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """按 exe / 同名找出重复快捷方式。"""
+    if games is None:
+        games = list_all_nonsteam_games()
+    by_exe: Dict[str, List[Dict[str, Any]]] = {}
+    by_name: Dict[str, List[Dict[str, Any]]] = {}
+    for g in games:
+        exe = _normalize(g.get("exe") or "") or ""
+        name = str(g.get("name") or "").strip().lower()
+        if exe:
+            by_exe.setdefault(exe, []).append(g)
+        if name:
+            by_name.setdefault(name, []).append(g)
+
+    groups: List[Dict[str, Any]] = []
+    seen_idsets = set()
+    for exe, items in by_exe.items():
+        if len(items) < 2:
+            continue
+        idset = tuple(sorted(normalize_appid(i.get("appid")) for i in items))
+        seen_idsets.add(idset)
+        groups.append(
+            {
+                "reason": "same_exe",
+                "label": os.path.basename(exe) or exe,
+                "exe": exe,
+                "games": items,
+            }
+        )
+    for name, items in by_name.items():
+        if len(items) < 2:
+            continue
+        idset = tuple(sorted(normalize_appid(i.get("appid")) for i in items))
+        if idset in seen_idsets:
+            continue
+        groups.append(
+            {
+                "reason": "same_name",
+                "label": items[0].get("name") or name,
+                "exe": "",
+                "games": items,
+            }
+        )
+    return {
+        "success": True,
+        "groups": groups,
+        "count": len(groups),
+        "dup_entry_count": sum(len(g["games"]) for g in groups),
+        "message": f"发现 {len(groups)} 组重复快捷方式" if groups else "未发现重复快捷方式",
+    }
+
+
 def _normalize(p: str) -> Optional[str]:
     """将 Steam 路径转为真实绝对路径。
 
@@ -567,12 +775,23 @@ _SKIP_EXE_RE = re.compile(
     r"(unitycrashhandler|crashhandler|crashpad|uninstall|unins\d*|"
     r"vcredist|dxsetup|directx|redist|\.net|dotnet|setup\.exe|"
     r"notification_helper|steam\.exe|pythonw?\.exe|zsync|"
-    r"payload|installer|crash_reporter|helper\.exe)",
+    r"payload|installer|crash_reporter|helper\.exe|"
+    r"inject(?:or)?|mtool|getpefileinfo|createdump|nwjc|"
+    r"bandizip|winrar|winzip|7zfm|7zg|"
+    r"patcher|workshopuploader|steamworkshop|"
+    r"oalinst|vc_redist|dxwebsetup|steamclient_loader|"
+    r"configtool|dbghelp|crashrpt|unitycrash)",
+    re.I,
+)
+_SKIP_NAME_RE = re.compile(
+    r"^(inject|mtool|createdump|oalinst|unins\d*|setup|install|"
+    r"handler|getpefileinfo|nwjc)$",
     re.I,
 )
 _SKIP_DIR_NAMES = {
     "_commonredist",
     "redist",
+    "_redist",
     "directx",
     "support",
     "__macosx",
@@ -583,6 +802,11 @@ _SKIP_DIR_NAMES = {
     "engine",
     "dotnet",
     "mono",
+    "loaders",
+    "解压工具",
+    "汉化补丁",
+    "steamworkshopuploader",
+    "_exe_extract",
 }
 
 
@@ -603,6 +827,8 @@ def load_settings() -> Dict[str, Any]:
         "auto_extract": True,  # 扫描时自动解压压缩包
         "extract_depth": 2,  # 压缩包嵌套解压层数
         "hidden_exes": [],  # 隐藏的启动项（归一化绝对路径）
+        # 截图设为图标时的输出最长边（像素）；0=原图不缩放
+        "screenshot_max_edge": 768,
     }
     path = _settings_path()
     try:
@@ -627,6 +853,16 @@ def load_settings() -> Dict[str, Any]:
         defaults["extract_depth"] = 2
     defaults["userdata_id"] = str(defaults.get("userdata_id") or "").strip()
     defaults["auto_extract"] = bool(defaults.get("auto_extract", True))
+    try:
+        sme = int(defaults.get("screenshot_max_edge", 768) or 0)
+        # 0=原图；否则限制在合理范围
+        if sme < 0:
+            sme = 0
+        elif sme > 0:
+            sme = max(128, min(2048, sme))
+        defaults["screenshot_max_edge"] = sme
+    except Exception:  # noqa: BLE001
+        defaults["screenshot_max_edge"] = 768
     hidden = defaults.get("hidden_exes") or []
     if not isinstance(hidden, list):
         hidden = []
@@ -675,6 +911,16 @@ def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
                     seen.add(n)
                     cleaned.append(n)
             cur["hidden_exes"] = cleaned
+    if "screenshot_max_edge" in settings:
+        try:
+            sme = int(settings.get("screenshot_max_edge") or 0)
+            if sme < 0:
+                sme = 0
+            elif sme > 0:
+                sme = max(128, min(2048, sme))
+            cur["screenshot_max_edge"] = sme
+        except Exception:  # noqa: BLE001
+            pass
     path = _settings_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fp:
@@ -769,6 +1015,9 @@ def _is_candidate_filename(name: str) -> bool:
     lower = name.lower()
     if _SKIP_EXE_RE.search(lower):
         return False
+    stem = os.path.splitext(name)[0]
+    if _SKIP_NAME_RE.search(stem):
+        return False
     if lower.endswith((".exe", ".appimage")):
         return True
     # 注意：不要把 .bin（光盘镜像等）当成启动器
@@ -810,42 +1059,429 @@ def _score_exe(path: str, scan_root: str) -> int:
     depth = rel.count(os.sep)
     score += max(0, 40 - depth * 8)
     # 降权
-    if "updater" in lower or "launcher" in lower and "game" not in lower:
+    if "updater" in lower or ("launcher" in lower and "game" not in lower):
         score -= 15
     if "language" in lower or "config" in lower or "setting" in lower:
         score -= 40
     if "crash" in lower or "report" in lower:
         score -= 100
+    if any(x in lower for x in ("inject", "mtool", "patch", "setup", "install", "unpack")):
+        score -= 80
     return score
 
 
-def _guess_game_name(exe_path: str, scan_root: str) -> str:
-    parent = os.path.basename(os.path.dirname(exe_path))
-    # 若父目录是无意义层（如 XJ12345），再往上
-    name = parent
-    cur = os.path.dirname(exe_path)
-    scan_root = os.path.realpath(scan_root)
-    for _ in range(3):
-        base = os.path.basename(cur)
-        if re.fullmatch(r"XJ\d+", base, re.I) or re.fullmatch(r"\d+", base):
-            parent2 = os.path.basename(os.path.dirname(cur))
-            if parent2 and os.path.realpath(cur) != scan_root:
-                cur = os.path.dirname(cur)
-                name = os.path.basename(cur) if os.path.realpath(cur) != scan_root else parent
-                continue
-        # 若当前名太泛
-        if base.lower() in ("bin", "binaries", "game", "win64", "win32", "x64", "x86"):
-            cur = os.path.dirname(cur)
-            if os.path.realpath(cur) == scan_root:
-                break
-            name = os.path.basename(cur)
+# 技术/中间目录：命名时跳过，继续向上找「游戏文件夹」
+_TECH_FOLDER_NAMES = {
+    "bin",
+    "binaries",
+    "win64",
+    "win32",
+    "x64",
+    "x86",
+    "x86_64",
+    "game",
+    "games",
+    "engine",
+    "redist",
+    "_commonredist",
+    "support",
+    "data",
+    "datas",
+    "resources",
+    "content",
+    "plugins",
+    "modules",
+    "system",
+    "ship",
+    "shipping",
+    "windows",
+    "win",
+    "linux",
+    "macos",
+    "mac",
+    "program",
+    "program files",
+    "program files (x86)",
+    "steamapps",
+    "common",
+    "launcher",
+    "launchers",
+    "tools",
+    "bin_win64",
+    "bin_win32",
+    "x64shipping",
+    "development",
+    "debug",
+    "release",
+}
+
+
+def _is_pack_or_tech_folder(name: str) -> bool:
+    """打包码 / 纯数字 / 技术目录，不适合作为游戏显示名。"""
+    if not name or name in (".", ".."):
+        return True
+    n = name.lower().strip()
+    if n in _TECH_FOLDER_NAMES:
+        return True
+    if re.fullmatch(r"xj\d+", n):
+        return True
+    if re.fullmatch(r"\d+", n):
+        return True
+    # 过短的无意义名
+    if len(n) <= 1:
+        return True
+    return False
+
+
+# 有问题的游戏：文件夹名后缀标记（不必删除，便于识别/跳过自动添加）
+TROUBLE_SUFFIX = "-trouble"
+
+
+def _strip_trouble_suffix(name: str) -> str:
+    n = str(name or "")
+    if n.lower().endswith(TROUBLE_SUFFIX):
+        return n[: -len(TROUBLE_SUFFIX)]
+    return n
+
+
+def _has_trouble_suffix(name: str) -> bool:
+    return str(name or "").lower().endswith(TROUBLE_SUFFIX)
+
+
+def _path_has_trouble(path: str) -> bool:
+    """路径任一层文件夹名以 -trouble 结尾则视为问题项。"""
+    p = _normalize(path) or str(path or "")
+    if not p:
+        return False
+    for part in p.replace("\\", "/").split("/"):
+        if part and _has_trouble_suffix(part):
+            return True
+    return False
+
+
+def _collect_path_parts(exe_path: str, scan_root: str = "") -> List[str]:
+    """从 exe 目录向上到 scan_root（不含）收集路径段，靠近 root 在前。"""
+    exe_path = _normalize(exe_path) or exe_path
+    if not exe_path:
+        return []
+    scan_root_rp = ""
+    if scan_root:
+        try:
+            scan_root_rp = os.path.realpath(os.path.expanduser(scan_root))
+        except Exception:  # noqa: BLE001
+            scan_root_rp = ""
+
+    cur = os.path.dirname(os.path.realpath(exe_path))
+    parts: List[str] = []
+    for _ in range(12):
+        if not cur or cur in ("/", "."):
+            break
+        try:
+            cur_rp = os.path.realpath(cur)
+        except Exception:  # noqa: BLE001
+            cur_rp = cur
+        if scan_root_rp and cur_rp == scan_root_rp:
+            break
+        base = os.path.basename(cur_rp.rstrip("/"))
+        if base:
+            parts.append(base)
+        parent = os.path.dirname(cur_rp)
+        if parent == cur_rp:
+            break
+        cur = parent
+    parts.reverse()
+    return parts
+
+
+def _resolve_game_folder(exe_path: str, scan_root: str = "") -> str:
+    """解析用于命名/标记的「游戏文件夹」绝对路径。"""
+    exe_path = _normalize(exe_path) or exe_path
+    if not exe_path:
+        return ""
+    try:
+        exe_rp = os.path.realpath(exe_path)
+    except Exception:  # noqa: BLE001
+        exe_rp = exe_path
+    start = os.path.dirname(exe_rp)
+    parts = _collect_path_parts(exe_path, scan_root)
+    if not parts:
+        return start
+
+    meaningful = [p for p in parts if not _is_pack_or_tech_folder(p)]
+    target_name = meaningful[-1] if meaningful else parts[-1]
+
+    # 从 exe 向上找到 basename == target_name 的目录
+    cur = start
+    for _ in range(12):
+        if not cur or cur in ("/", "."):
+            break
+        try:
+            cur_rp = os.path.realpath(cur)
+        except Exception:  # noqa: BLE001
+            cur_rp = cur
+        if os.path.basename(cur_rp.rstrip("/")) == target_name:
+            return cur_rp
+        parent = os.path.dirname(cur_rp)
+        if parent == cur_rp:
+            break
+        cur = parent
+    return start
+
+
+def _guess_game_name(exe_path: str, scan_root: str = "") -> str:
+    """用「游戏所在文件夹名」作为显示名，不用 exe 文件名。
+
+    例如：
+      .../Drop Duchy v1.0.1/DropDuchy/Binaries/Win64/xxx.exe
+        → 跳过 Win64、Binaries →「DropDuchy」
+      .../XJ07980/DRAPLINE.Early.Access/DRAPLINE.exe
+        → 跳过 XJ07980 →「DRAPLINE.Early.Access」
+      .../SomeGame-trouble/game.exe
+        →「SomeGame-trouble」（保留问题标记）
+    仅在完全无法从路径取到文件夹时，才回退到 exe 主名。
+    """
+    exe_path = _normalize(exe_path) or exe_path
+    if not exe_path:
+        return "Game"
+
+    parts = _collect_path_parts(exe_path, scan_root)
+    meaningful = [p for p in parts if not _is_pack_or_tech_folder(p)]
+
+    if meaningful:
+        # 取最靠近启动器、且有意义的文件夹（游戏根目录）
+        return meaningful[-1]
+
+    # 若全被过滤：用相对 scan_root 的第一层目录
+    if parts:
+        for p in parts:
+            if not _is_pack_or_tech_folder(p):
+                return p
+        return parts[-1] if parts else parts[0]
+
+    # 最后回退：start 目录名，再不行才用 exe 主名
+    parent = os.path.basename(os.path.dirname(os.path.realpath(exe_path)))
+    if parent and not _is_pack_or_tech_folder(parent):
+        return parent
+    return os.path.splitext(os.path.basename(exe_path))[0]
+
+
+def _rewrite_path_prefix(path: str, old_prefix: str, new_prefix: str) -> str:
+    """把路径中 old_prefix 前缀换成 new_prefix（保留引号风格）。"""
+    raw = str(path or "")
+    if not raw or not old_prefix:
+        return raw
+    quoted = False
+    body = raw.strip()
+    if len(body) >= 2 and body[0] == body[-1] and body[0] in "\"'":
+        quoted = True
+        body = body[1:-1]
+    body_n = body.replace("\\", "/")
+    old_n = old_prefix.replace("\\", "/").rstrip("/")
+    new_n = new_prefix.replace("\\", "/").rstrip("/")
+    if body_n == old_n or body_n.startswith(old_n + "/"):
+        body_n = new_n + body_n[len(old_n) :]
+    else:
+        # 大小写不敏感再试（Steam Deck 路径一般区分大小写，但防万一）
+        if body_n.lower() == old_n.lower() or body_n.lower().startswith(old_n.lower() + "/"):
+            body_n = new_n + body_n[len(old_n) :]
+        else:
+            return raw
+    return f'"{body_n}"' if quoted else body_n
+
+
+def _update_shortcuts_after_folder_rename(old_folder: str, new_folder: str) -> int:
+    """重命名游戏目录后，同步所有用户 shortcuts 里的 Exe/StartDir/icon。"""
+    root = find_steam_root()
+    if not root:
+        return 0
+    old_n = os.path.realpath(old_folder).replace("\\", "/").rstrip("/")
+    new_n = os.path.realpath(new_folder).replace("\\", "/").rstrip("/")
+    if not old_n or old_n == new_n:
+        return 0
+    ud = os.path.join(root, "userdata")
+    if not os.path.isdir(ud):
+        return 0
+    updated = 0
+    for sid in os.listdir(ud):
+        sc = os.path.join(ud, sid, "config", "shortcuts.vdf")
+        if not os.path.isfile(sc):
             continue
-        name = base
-        break
-    # 回退到 exe 名
-    if not name or name in (".", ""):
-        name = os.path.splitext(os.path.basename(exe_path))[0]
-    return name
+        try:
+            with open(sc, "rb") as fp:
+                parsed = _read_node(fp)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("read shortcuts for rename update failed %s: %s", sc, e)
+            continue
+        shortcuts = parsed.get("shortcuts")
+        if not isinstance(shortcuts, dict):
+            continue
+        changed = False
+        for _k, entry in shortcuts.items():
+            if not isinstance(entry, dict):
+                continue
+            for field in ("Exe", "StartDir", "icon", "ShortcutPath"):
+                val = entry.get(field)
+                if not isinstance(val, str) or not val:
+                    continue
+                new_val = _rewrite_path_prefix(val, old_n, new_n)
+                if new_val != val:
+                    entry[field] = new_val
+                    changed = True
+        if changed:
+            try:
+                write_vdf(sc, parsed)
+                updated += 1
+            except Exception as e:  # noqa: BLE001
+                logger.error("write shortcuts after rename failed %s: %s", sc, e)
+    return updated
+
+
+def _update_hidden_exes_after_rename(old_folder: str, new_folder: str) -> int:
+    """同步设置里 hidden_exes 的路径前缀。"""
+    cur = load_settings()
+    hidden = list(cur.get("hidden_exes") or [])
+    if not hidden:
+        return 0
+    old_n = os.path.realpath(old_folder).replace("\\", "/").rstrip("/")
+    new_n = os.path.realpath(new_folder).replace("\\", "/").rstrip("/")
+    changed = 0
+    new_hidden = []
+    for h in hidden:
+        nh = _rewrite_path_prefix(str(h), old_n, new_n)
+        if nh != h:
+            changed += 1
+        new_hidden.append(nh)
+    if changed:
+        cur["hidden_exes"] = new_hidden
+        save_settings(cur)
+    return changed
+
+
+def mark_games_trouble(
+    exes: List[str],
+    scan_root: str = "",
+    mark: bool = True,
+) -> Dict[str, Any]:
+    """给游戏文件夹加/去掉 -trouble 后缀（不删除文件）。
+
+    mark=True  →  Folder  → Folder-trouble
+    mark=False →  Folder-trouble → Folder
+    已在 Steam 的快捷方式路径会一并改写。
+    """
+    settings = load_settings()
+    root = str(scan_root or settings.get("scan_path") or _DEFAULT_SCAN_PATH)
+    done = []
+    skipped = []
+    seen_folders = set()
+
+    for raw in exes or []:
+        exe = _normalize(str(raw)) or str(raw or "").strip()
+        if not exe:
+            skipped.append({"exe": raw, "reason": "空路径"})
+            continue
+        if not os.path.isfile(exe) and not os.path.isdir(os.path.dirname(exe)):
+            # 文件可能刚被挪走；仍尝试从路径解析文件夹
+            pass
+
+        folder = _resolve_game_folder(exe, root)
+        if not folder or not os.path.isdir(folder):
+            # 回退：exe 所在目录
+            folder = os.path.dirname(os.path.realpath(exe)) if os.path.exists(exe) else ""
+        if not folder or not os.path.isdir(folder):
+            skipped.append({"exe": exe, "reason": "找不到游戏文件夹"})
+            continue
+
+        try:
+            folder_rp = os.path.realpath(folder)
+        except Exception:  # noqa: BLE001
+            folder_rp = folder
+
+        if folder_rp in seen_folders:
+            skipped.append({"exe": exe, "reason": "同文件夹已处理", "folder": folder_rp})
+            continue
+
+        base = os.path.basename(folder_rp.rstrip("/"))
+        parent = os.path.dirname(folder_rp)
+        if mark:
+            if _has_trouble_suffix(base):
+                skipped.append(
+                    {
+                        "exe": exe,
+                        "reason": "已是 -trouble",
+                        "folder": folder_rp,
+                        "name": base,
+                    }
+                )
+                seen_folders.add(folder_rp)
+                continue
+            new_base = base + TROUBLE_SUFFIX
+        else:
+            if not _has_trouble_suffix(base):
+                skipped.append(
+                    {
+                        "exe": exe,
+                        "reason": "未标记 -trouble",
+                        "folder": folder_rp,
+                        "name": base,
+                    }
+                )
+                seen_folders.add(folder_rp)
+                continue
+            new_base = _strip_trouble_suffix(base)
+
+        new_folder = os.path.join(parent, new_base)
+        if os.path.exists(new_folder):
+            skipped.append(
+                {
+                    "exe": exe,
+                    "reason": f"目标已存在: {new_base}",
+                    "folder": folder_rp,
+                }
+            )
+            continue
+
+        try:
+            os.rename(folder_rp, new_folder)
+        except Exception as e:  # noqa: BLE001
+            logger.error("rename trouble mark failed %s -> %s: %s", folder_rp, new_folder, e)
+            skipped.append({"exe": exe, "reason": f"重命名失败: {e}", "folder": folder_rp})
+            continue
+
+        seen_folders.add(os.path.realpath(new_folder))
+        sc_n = _update_shortcuts_after_folder_rename(folder_rp, new_folder)
+        hid_n = _update_hidden_exes_after_rename(folder_rp, new_folder)
+        # 新 exe 路径（若原 exe 在该文件夹下）
+        new_exe = _rewrite_path_prefix(exe, folder_rp, new_folder)
+        done.append(
+            {
+                "exe": exe,
+                "new_exe": new_exe,
+                "old_folder": folder_rp,
+                "new_folder": os.path.realpath(new_folder),
+                "name": new_base,
+                "shortcuts_updated": sc_n,
+                "hidden_updated": hid_n,
+                "marked": mark,
+            }
+        )
+        logger.info(
+            "trouble mark=%s %s -> %s (shortcuts=%s)",
+            mark,
+            folder_rp,
+            new_folder,
+            sc_n,
+        )
+
+    action = "标记 -trouble" if mark else "取消 -trouble"
+    return {
+        "success": True,
+        "marked": mark,
+        "done": done,
+        "skipped": skipped,
+        "done_count": len(done),
+        "skipped_count": len(skipped),
+        "message": f"{action} 成功 {len(done)} 个，跳过 {len(skipped)} 个（文件夹保留，未删除）。",
+    }
 
 
 def _existing_shortcut_exes() -> set:
@@ -913,7 +1549,15 @@ def _dir_nonempty(path: str) -> bool:
         return False
 
 
-def _run_cmd(cmd: List[str], timeout: int = 600) -> tuple:
+def _clean_subprocess_env() -> dict:
+    """去掉 Decky/PyInstaller 注入的库路径，避免系统 spectacle/ffmpeg 链错 so。"""
+    env = os.environ.copy()
+    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
+        env.pop(key, None)
+    return env
+
+
+def _run_cmd(cmd: List[str], timeout: int = 600, env: Optional[dict] = None) -> tuple:
     import subprocess
 
     try:
@@ -923,10 +1567,52 @@ def _run_cmd(cmd: List[str], timeout: int = 600) -> tuple:
             stderr=subprocess.PIPE,
             timeout=timeout,
             check=False,
+            env=env if env is not None else _clean_subprocess_env(),
         )
         return r.returncode, (r.stderr or b"").decode("utf-8", "replace")[:500]
     except Exception as e:  # noqa: BLE001
         return 99, str(e)
+
+
+def _archive_member_safe(name: str, dest_dir: str) -> bool:
+    """拒绝压缩包内的绝对路径 / .. 穿越。"""
+    if not name or name.startswith("/") or name.startswith("\\"):
+        return False
+    # Windows 盘符
+    if len(name) >= 2 and name[1] == ":":
+        return False
+    dest_rp = os.path.realpath(dest_dir)
+    # zip 里可能是 dir/../etc/passwd
+    joined = os.path.realpath(os.path.join(dest_dir, name.replace("\\", "/")))
+    try:
+        return os.path.commonpath([dest_rp, joined]) == dest_rp
+    except ValueError:
+        return False
+
+
+def _safe_zip_extract(archive_path: str, dest_dir: str) -> None:
+    import zipfile
+
+    with zipfile.ZipFile(archive_path, "r") as zf:
+        for info in zf.infolist():
+            name = info.filename
+            if not _archive_member_safe(name, dest_dir):
+                logger.warning("skip unsafe zip member %s in %s", name, archive_path)
+                continue
+            zf.extract(info, dest_dir)
+
+
+def _safe_tar_extract(archive_path: str, dest_dir: str) -> None:
+    import tarfile
+
+    with tarfile.open(archive_path, "r:*") as tf:
+        safe = []
+        for member in tf.getmembers():
+            if not _archive_member_safe(member.name, dest_dir):
+                logger.warning("skip unsafe tar member %s in %s", member.name, archive_path)
+                continue
+            safe.append(member)
+        tf.extractall(dest_dir, members=safe)
 
 
 def _extract_one_archive(archive_path: str, dest_dir: str) -> Dict[str, Any]:
@@ -952,10 +1638,7 @@ def _extract_one_archive(archive_path: str, dest_dir: str) -> Dict[str, Any]:
             if code == 0:
                 return {"ok": True, "skipped": False, "dest": dest_dir, "tool": "unzip"}
         try:
-            import zipfile
-
-            with zipfile.ZipFile(archive_path, "r") as zf:
-                zf.extractall(dest_dir)
+            _safe_zip_extract(archive_path, dest_dir)
             return {"ok": True, "skipped": False, "dest": dest_dir, "tool": "zipfile"}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "dest": dest_dir, "message": f"zip 解压失败: {e}"}
@@ -974,10 +1657,7 @@ def _extract_one_archive(archive_path: str, dest_dir: str) -> Dict[str, Any]:
             if code == 0:
                 return {"ok": True, "skipped": False, "dest": dest_dir, "tool": "tar"}
         try:
-            import tarfile
-
-            with tarfile.open(archive_path, "r:*") as tf:
-                tf.extractall(dest_dir)
+            _safe_tar_extract(archive_path, dest_dir)
             return {"ok": True, "skipped": False, "dest": dest_dir, "tool": "tarfile"}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "dest": dest_dir, "message": f"tar 解压失败: {e}"}
@@ -1058,6 +1738,1263 @@ def extract_archives_in_tree(
     }
 
 
+def _icons_data_dir() -> str:
+    """图标稳定存放目录（添加后可后期手动替换同名文件）。"""
+    env = (os.environ.get("DECKY_PLUGIN_SETTINGS_DIR") or "").strip()
+    if env:
+        # settings 旁的 data：.../settings/NonSteamCleaner -> .../data/NonSteamCleaner/icons
+        # 直接用标准 homebrew 路径更清晰
+        pass
+    base = os.path.expanduser("~/homebrew/data/NonSteamCleaner/icons")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+# 图标文件名优先级（高 → 低）
+_ICON_BASENAMES = (
+    "icon.ico",
+    "Icon.ico",
+    "ICON.ICO",
+    "game.ico",
+    "Game.ico",
+    "app.ico",
+    "App.ico",
+    "logo.ico",
+    "icon.png",
+    "Icon.png",
+    "game.png",
+    "Game.png",
+    "logo.png",
+    "Logo.png",
+    "app.png",
+    "AppIcon.png",
+    "app_icon.png",
+    "cover.png",
+    "Cover.png",
+)
+
+
+def _score_icon_path(path: str, exe_stem: str) -> int:
+    """图标匹配分数，越高越好。"""
+    base = os.path.basename(path)
+    lower = base.lower()
+    stem = os.path.splitext(base)[0].lower()
+    score = 0
+    if lower.endswith(".ico"):
+        score += 40
+    elif lower.endswith(".png"):
+        score += 30
+    elif lower.endswith((".jpg", ".jpeg")):
+        score += 15
+    # 与 exe 同名
+    if stem == exe_stem.lower():
+        score += 100
+    if stem in ("icon", "game", "app", "logo", "appicon", "app_icon"):
+        score += 50
+    # 排除杂项
+    if any(x in lower for x in ("uninstall", "support", "gog", "steam", "crash", "sbicon", "webcache")):
+        score -= 80
+    try:
+        sz = os.path.getsize(path)
+        # 过小可能是占位图；过大也少见
+        if 1024 <= sz <= 5 * 1024 * 1024:
+            score += 10
+        if sz < 200:
+            score -= 50
+    except Exception:  # noqa: BLE001
+        pass
+    return score
+
+
+def _detect_image_ext(path: str) -> Optional[str]:
+    """根据文件头判断 png/ico/jpg。"""
+    try:
+        with open(path, "rb") as fp:
+            head = fp.read(16)
+    except Exception:  # noqa: BLE001
+        return None
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if head[:4] == b"\x00\x00\x01\x00":
+        return ".ico"
+    if head[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    # 有些 7z 抽出的大尺寸图标是 PNG 裸数据但无扩展名
+    if len(head) >= 8 and head[0] == 0x89 and b"PNG" in head[:8]:
+        return ".png"
+    return None
+
+
+def extract_icon_from_pe_exe(exe_path: str) -> Optional[str]:
+    """从 Windows .exe 内嵌资源提取最佳图标（依赖 7z 读 PE/.rsrc）。
+
+    返回提取后的本地文件路径（带正确扩展名），失败返回 None。
+    """
+    exe_path = _normalize(exe_path) or exe_path
+    if not exe_path or not os.path.isfile(exe_path):
+        return None
+    if not exe_path.lower().endswith(".exe"):
+        return None
+    seven = shutil.which("7z") or shutil.which("7za")
+    if not seven:
+        logger.warning("7z 不可用，无法从 exe 提取图标")
+        return None
+
+    import hashlib
+    import tempfile
+
+    # 缓存：同一 exe 不重复解压
+    h = hashlib.md5(exe_path.encode("utf-8", "replace")).hexdigest()[:12]
+    try:
+        st = os.stat(exe_path)
+        cache_key = f"{h}_{int(st.st_mtime)}_{st.st_size}"
+    except Exception:  # noqa: BLE001
+        cache_key = h
+    cache_dir = os.path.join(_icons_data_dir(), "_exe_extract", cache_key)
+    cached_png = os.path.join(cache_dir, "best.png")
+    cached_ico = os.path.join(cache_dir, "best.ico")
+    if os.path.isfile(cached_png) and os.path.getsize(cached_png) > 100:
+        return cached_png
+    if os.path.isfile(cached_ico) and os.path.getsize(cached_ico) > 100:
+        return cached_ico
+
+    tmp = tempfile.mkdtemp(prefix="nsc_exe_icon_")
+    try:
+        # 只抽 ICON 资源，避免解出整个 .text
+        patterns = [
+            "-ir!.rsrc/*/ICON/*",
+            "-ir!.rsrc/ICON/*",
+            "-ir!*ICON*",
+        ]
+        extracted_any = False
+        for pat in patterns:
+            code, err = _run_cmd(
+                [seven, "e", "-y", f"-o{tmp}", exe_path, pat],
+                timeout=120,
+            )
+            # 即使部分失败，也可能已抽出文件
+            try:
+                if any(os.scandir(tmp)):
+                    extracted_any = True
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            if code != 0:
+                logger.debug("7z icon extract %s: %s", pat, err)
+
+        if not extracted_any:
+            return None
+
+        # 挑选最大的有效图像
+        best_path = None
+        best_size = 0
+        best_ext = None
+        for dirpath, _dns, fns in os.walk(tmp):
+            # 跳过 GROUP_ICON 一类极小文件
+            if "GROUP_ICON" in dirpath.upper():
+                continue
+            for fn in fns:
+                full = os.path.join(dirpath, fn)
+                try:
+                    sz = os.path.getsize(full)
+                except Exception:  # noqa: BLE001
+                    continue
+                if sz < 200 or sz > 8 * 1024 * 1024:
+                    continue
+                ext = _detect_image_ext(full)
+                if not ext:
+                    # 无头但体积大的 ICON/1 常见为 PNG 裸流——再读一下
+                    try:
+                        with open(full, "rb") as fp:
+                            b = fp.read(8)
+                        if b.startswith(b"\x89PNG"):
+                            ext = ".png"
+                        else:
+                            continue
+                    except Exception:  # noqa: BLE001
+                        continue
+                # 优先更大尺寸（通常文件更大）
+                rank = sz
+                if ext == ".png":
+                    rank += 50_000  # 略偏好 png
+                if rank > best_size:
+                    best_size = rank
+                    best_path = full
+                    best_ext = ext
+
+        if not best_path or not best_ext:
+            return None
+
+        os.makedirs(cache_dir, exist_ok=True)
+        dest = os.path.join(cache_dir, "best" + best_ext)
+        shutil.copy2(best_path, dest)
+        # 同步别名，方便后续查找
+        if best_ext == ".png":
+            try:
+                shutil.copy2(dest, cached_png)
+            except Exception:  # noqa: BLE001
+                pass
+        logger.info("extracted exe icon %s -> %s (%s bytes)", exe_path, dest, best_size)
+        return dest
+    except Exception as e:  # noqa: BLE001
+        logger.warning("extract_icon_from_pe_exe failed %s: %s", exe_path, e)
+        return None
+    finally:
+        try:
+            shutil.rmtree(tmp, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def find_icon_for_exe(exe_path: str, start_dir: str = "") -> Optional[str]:
+    """在启动器附近查找图标；若无外置图标则从 .exe 内嵌资源提取。"""
+    exe_path = _normalize(exe_path) or exe_path
+    if not exe_path:
+        return None
+    exe_dir = os.path.dirname(exe_path)
+    start = _normalize(start_dir) or exe_dir
+    exe_stem = os.path.splitext(os.path.basename(exe_path))[0]
+
+    search_dirs = []
+    for d in (exe_dir, start, os.path.dirname(exe_dir), os.path.dirname(start)):
+        if d and os.path.isdir(d) and d not in search_dirs:
+            search_dirs.append(d)
+
+    candidates: List[str] = []
+    # 1) 外置图标文件
+    for d in search_dirs:
+        for ext in (".ico", ".png", ".jpg", ".jpeg"):
+            p = os.path.join(d, exe_stem + ext)
+            if os.path.isfile(p):
+                candidates.append(p)
+        for bn in _ICON_BASENAMES:
+            p = os.path.join(d, bn)
+            if os.path.isfile(p):
+                candidates.append(p)
+        try:
+            for fn in os.listdir(d):
+                lower = fn.lower()
+                full = os.path.join(d, fn)
+                if not os.path.isfile(full):
+                    continue
+                if lower.endswith(".ico"):
+                    candidates.append(full)
+                elif lower.endswith(".png") and (
+                    "icon" in lower or "logo" in lower or "cover" in lower
+                ):
+                    candidates.append(full)
+        except Exception:  # noqa: BLE001
+            pass
+
+    uniq = []
+    seen = set()
+    for c in candidates:
+        try:
+            rp = os.path.realpath(c)
+        except Exception:  # noqa: BLE001
+            rp = c
+        if rp not in seen and os.path.isfile(rp):
+            seen.add(rp)
+            uniq.append(rp)
+
+    if uniq:
+        uniq.sort(key=lambda p: (-_score_icon_path(p, exe_stem), len(p)))
+        best = uniq[0]
+        if _score_icon_path(best, exe_stem) >= 0:
+            return best
+
+    # 2) 从 exe 内嵌资源提取（用户说 exe 自带图标）
+    if exe_path.lower().endswith(".exe"):
+        pe_icon = extract_icon_from_pe_exe(exe_path)
+        if pe_icon:
+            return pe_icon
+
+    return None
+
+
+def load_icon_data_url(icon_path: str, max_edge: int = 64) -> str:
+    """把本地图标转成 data URL，供前端 <img> 直接显示（避免 file:// 被 CEF 拦截）。
+
+    大图用 ffmpeg 缩到 max_edge 以控制体积。
+    """
+    import base64
+    import tempfile
+
+    icon_path = _normalize(icon_path) or icon_path
+    if not icon_path or not os.path.isfile(icon_path):
+        return ""
+
+    ext = _detect_image_ext(icon_path) or os.path.splitext(icon_path)[1].lower() or ".png"
+    mime = {
+        ".png": "image/png",
+        ".ico": "image/x-icon",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+    }.get(ext, "image/png")
+
+    try:
+        sz = os.path.getsize(icon_path)
+    except Exception:  # noqa: BLE001
+        return ""
+
+    raw: Optional[bytes] = None
+    # 小文件直接嵌入
+    if sz <= 48 * 1024 and ext in (".png", ".jpg", ".jpeg", ".ico"):
+        try:
+            raw = open(icon_path, "rb").read()
+        except Exception:  # noqa: BLE001
+            raw = None
+
+    # 大图 / 需要统一尺寸：ffmpeg 缩略图
+    if raw is None:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            tmp_out = None
+            try:
+                fd, tmp_out = tempfile.mkstemp(suffix=".png")
+                os.close(fd)
+                # 保持比例，限制在 max_edge 内
+                vf = f"scale={max_edge}:{max_edge}:force_original_aspect_ratio=decrease"
+                code, err = _run_cmd(
+                    [
+                        ffmpeg,
+                        "-y",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        icon_path,
+                        "-vf",
+                        vf,
+                        tmp_out,
+                    ],
+                    timeout=30,
+                )
+                if code == 0 and os.path.isfile(tmp_out) and os.path.getsize(tmp_out) > 50:
+                    raw = open(tmp_out, "rb").read()
+                    mime = "image/png"
+                else:
+                    logger.debug("ffmpeg thumb fail: %s", err)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("ffmpeg thumb error: %s", e)
+            finally:
+                if tmp_out and os.path.exists(tmp_out):
+                    try:
+                        os.remove(tmp_out)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    # 仍失败则硬塞（限制 150KB）
+    if raw is None and sz <= 150 * 1024:
+        try:
+            raw = open(icon_path, "rb").read()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    if not raw:
+        return ""
+    b64 = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def _ffmpeg_to_png(src: str, dest: str, max_edge: int = 0) -> bool:
+    """将任意图标转为 PNG；max_edge>0 时等比缩放到边长内（不放大）。"""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not src or not os.path.isfile(src):
+        return False
+    try:
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", src]
+        if max_edge and max_edge > 0:
+            # decrease=等比缩到边长内；flags=lanczos 更清晰；不放大原图
+            cmd += [
+                "-vf",
+                (
+                    f"scale='min({int(max_edge)},iw)':'min({int(max_edge)},ih)'"
+                    f":force_original_aspect_ratio=decrease:flags=lanczos"
+                ),
+            ]
+        cmd.append(dest)
+        code, err = _run_cmd(cmd, timeout=45)
+        if code == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 50:
+            return True
+        logger.debug("ffmpeg_to_png fail: %s", err)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("ffmpeg_to_png error: %s", e)
+    return False
+
+
+def _normalize_screenshot_max_edge(value: Any, default: int = 768) -> int:
+    """0=原图；否则 128..2048。"""
+    try:
+        v = int(value)
+    except Exception:  # noqa: BLE001
+        v = default
+    if v < 0:
+        return 0
+    if v == 0:
+        return 0
+    return max(128, min(2048, v))
+
+
+def _remove_grid_logo(appid: Any, userdata_id: str) -> bool:
+    """删除 grid/{appid}_logo.png。
+
+    Steam Deck 游戏详情页顶部「名称栏」规则：
+      - 有 _logo.png → 显示 logo 图，不再显示 AppName 文字
+      - 无 logo → 显示 shortcuts.vdf 里的 AppName
+
+    以前误把 exe 小图标写成 _logo.png，会导致详情页名称栏只有图标、没有文字标题。
+    """
+    root = find_steam_root()
+    if not root or not userdata_id:
+        return False
+    aid = str(normalize_appid(appid))
+    path = os.path.join(root, "userdata", str(userdata_id), "config", "grid", f"{aid}_logo.png")
+    if not os.path.isfile(path):
+        return False
+    try:
+        os.remove(path)
+        logger.info("removed grid logo (restore title text): %s", path)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("remove grid logo failed %s: %s", path, e)
+        return False
+
+
+def prepare_steam_icon(
+    icon_src: str,
+    appid: int,
+    userdata_id: str,
+    name: str = "",
+    icon_max_edge: int = 256,
+    capsule_max_edge: int = 0,
+) -> Dict[str, str]:
+    """把图标写入 Steam 能识别的位置，使库内非 Steam 项显示图标。
+
+    Steam Deck / 新客户端对非 Steam 游戏图标依赖：
+      - shortcuts.vdf 的 icon 字段（属性页小图标）
+      - grid/{appid}_icon.png  （库列表图标，最关键）
+      - grid/{appid}.png       （封面/胶囊，可选）
+      - grid/{appid}p.png      （竖版封面，可选）
+
+    icon_max_edge / capsule_max_edge:
+      - >0 时等比缩放，最长边不超过该值（且不放大）
+      - 0 表示不强制缩放（尽量原图）
+
+    注意：不要写入 grid/{appid}_logo.png！
+    Steam Deck 进入游戏详情页时，有 logo 就只显示 logo 图，名称栏不会再显示 AppName 文字。
+
+    appid 文件名用无符号 32 位十进制字符串。
+    """
+    out: Dict[str, str] = {
+        "icon": "",
+        "grid_icon": "",
+        "grid_capsule": "",
+        "source": icon_src or "",
+        "logo_removed": False,
+        "icon_max_edge": int(icon_max_edge or 0),
+        "capsule_max_edge": int(capsule_max_edge or 0),
+    }
+    # 无论有无图标源，都清掉可能误写的 logo，保证详情页名称栏显示文字
+    if userdata_id:
+        out["logo_removed"] = _remove_grid_logo(appid, userdata_id)
+
+    if not icon_src or not os.path.isfile(icon_src):
+        return out
+
+    aid = str(normalize_appid(appid))
+    icons_dir = _icons_data_dir()
+
+    # 统一转成 PNG（Steam 对 _icon.png 最稳；ico 作 icon 字段也可以）
+    # 稳定图按 icon 边长预处理，避免 shortcuts icon 字段过大
+    stable_edge = int(icon_max_edge or 0)
+    if stable_edge <= 0:
+        stable_edge = 256
+    stable_png = os.path.join(icons_dir, f"{aid}.png")
+    src_ext = (_detect_image_ext(icon_src) or os.path.splitext(icon_src)[1].lower() or "").lower()
+
+    ok_png = _ffmpeg_to_png(icon_src, stable_png, max_edge=stable_edge)
+    if not ok_png and src_ext == ".png":
+        try:
+            shutil.copy2(icon_src, stable_png)
+            ok_png = os.path.isfile(stable_png)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("copy png icon failed: %s", e)
+    if not ok_png and src_ext in (".ico", ".jpg", ".jpeg", ".png"):
+        # 回退：直接拷贝原文件到 data（至少 icon 字段有得用）
+        try:
+            fallback = os.path.join(icons_dir, f"{aid}{src_ext or '.ico'}")
+            shutil.copy2(icon_src, fallback)
+            out["icon"] = fallback
+        except Exception as e:  # noqa: BLE001
+            logger.warning("copy raw icon failed: %s", e)
+            out["icon"] = os.path.realpath(icon_src)
+    else:
+        out["icon"] = stable_png if ok_png else (os.path.realpath(icon_src))
+
+    # Steam grid 目录
+    root = find_steam_root()
+    if not root or not userdata_id:
+        return out
+
+    grid_dir = os.path.join(root, "userdata", str(userdata_id), "config", "grid")
+    try:
+        os.makedirs(grid_dir, exist_ok=True)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("mkdir grid failed: %s", e)
+        return out
+
+    # 封面用原图缩放；列表图标用 stable 或原图
+    src_full = icon_src
+    src_for_icon = stable_png if ok_png and os.path.isfile(stable_png) else icon_src
+
+    def _place(src: str, name: str, max_edge: int = 0) -> str:
+        dest = os.path.join(grid_dir, name)
+        if src.lower().endswith(".png") and max_edge <= 0:
+            try:
+                shutil.copy2(src, dest)
+                if os.path.isfile(dest):
+                    return dest
+            except Exception:  # noqa: BLE001
+                pass
+        if _ffmpeg_to_png(src, dest, max_edge=max_edge):
+            return dest
+        try:
+            shutil.copy2(src, dest)
+            return dest if os.path.isfile(dest) else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    # 列表小图标
+    i_edge = int(icon_max_edge or 0)
+    if i_edge <= 0:
+        i_edge = 256
+    grid_icon = _place(src_for_icon, f"{aid}_icon.png", max_edge=i_edge)
+    # 封面 / 竖版：可调最长边（0=尽量原图）
+    c_edge = int(capsule_max_edge or 0)
+    grid_cap = _place(src_full, f"{aid}.png", max_edge=c_edge)
+    grid_p = _place(src_full, f"{aid}p.png", max_edge=c_edge)
+    # 绝不写 _logo.png（见上方说明）
+
+    if grid_icon:
+        out["grid_icon"] = grid_icon
+    if grid_cap:
+        out["grid_capsule"] = grid_cap
+    if grid_p:
+        out["grid_portrait"] = grid_p
+
+    # shortcuts.vdf icon 字段：绝对路径，无引号（与现有成功写入的 DropDuchy 一致）
+    if out.get("icon"):
+        out["icon"] = os.path.realpath(out["icon"])
+    elif grid_icon:
+        out["icon"] = os.path.realpath(grid_icon)
+
+    logger.info(
+        "steam icon prepared appid=%s name=%s icon=%s grid_icon=%s capsule=%s "
+        "icon_edge=%s cap_edge=%s logo_removed=%s",
+        aid,
+        (name or "")[:40],
+        out.get("icon"),
+        out.get("grid_icon"),
+        out.get("grid_capsule"),
+        i_edge,
+        c_edge,
+        out.get("logo_removed"),
+    )
+    return out
+
+
+def _screenshots_data_dir() -> str:
+    d = os.path.expanduser("~/homebrew/data/NonSteamCleaner/screenshots")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _appid_dir_names(appid: Any) -> List[str]:
+    """Steam 截图目录可能用无符号或有符号十进制 appid。"""
+    u = normalize_appid(appid)
+    names = [str(u)]
+    try:
+        signed = appid_to_steam_int32(u)
+        if str(signed) not in names:
+            names.append(str(signed))
+    except Exception:  # noqa: BLE001
+        pass
+    return names
+
+
+def _iter_steam_screenshot_files(appid: Any = 0, userdata_id: str = "") -> List[str]:
+    """收集可能属于该游戏的截图文件（不含 thumbnails）。"""
+    root = find_steam_root()
+    if not root:
+        return []
+    files: List[str] = []
+    ud_root = os.path.join(root, "userdata")
+    if not os.path.isdir(ud_root):
+        return []
+
+    sids = [str(userdata_id)] if userdata_id else []
+    if not sids:
+        try:
+            sids = [d for d in os.listdir(ud_root) if d.isdigit()]
+        except Exception:  # noqa: BLE001
+            sids = []
+
+    app_names = _appid_dir_names(appid) if appid else []
+    exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+    def _collect_under(cdir: str, max_depth: int = 4) -> None:
+        if not os.path.isdir(cdir):
+            return
+        try:
+            for dirpath, dirnames, filenames in os.walk(cdir):
+                rel = os.path.relpath(dirpath, cdir)
+                depth = 0 if rel == "." else rel.count(os.sep) + 1
+                if depth > max_depth:
+                    dirnames[:] = []
+                    continue
+                # 跳过缩略图
+                dirnames[:] = [d for d in dirnames if d.lower() != "thumbnails"]
+                if os.path.basename(dirpath).lower() == "thumbnails":
+                    continue
+                for fn in filenames:
+                    if fn.lower().endswith(exts):
+                        files.append(os.path.join(dirpath, fn))
+        except Exception:  # noqa: BLE001
+            return
+
+    for sid in sids:
+        base760 = os.path.join(ud_root, sid, "760")
+        if not os.path.isdir(base760):
+            continue
+        # 优先：remote/<appid>/screenshots
+        if app_names:
+            for an in app_names:
+                _collect_under(os.path.join(base760, "remote", an, "screenshots"), 2)
+                _collect_under(os.path.join(base760, an, "screenshots"), 2)
+        # 全局截图目录（不按 appid 分子目录时）
+        _collect_under(os.path.join(base760, "screenshots"), 2)
+        # appid 未指定时才扫整个 remote（较慢）
+        if not app_names:
+            _collect_under(os.path.join(base760, "remote"), 3)
+
+    # 用户常见截图目录 + 插件自截目录
+    extra_roots = [
+        _screenshots_data_dir(),
+        os.path.expanduser("~/Pictures/Screenshots"),
+        os.path.expanduser("~/Pictures"),
+        os.path.expanduser("~/Desktop"),
+    ]
+    for er in extra_roots:
+        if not os.path.isdir(er):
+            continue
+        try:
+            for fn in os.listdir(er):
+                if fn.lower().endswith(exts):
+                    files.append(os.path.join(er, fn))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 去重
+    seen = set()
+    out = []
+    for f in files:
+        try:
+            rp = os.path.realpath(f)
+        except Exception:  # noqa: BLE001
+            rp = f
+        if rp in seen or not os.path.isfile(rp):
+            continue
+        seen.add(rp)
+        out.append(rp)
+    return out
+
+
+def find_latest_screenshot(
+    appid: Any = 0,
+    userdata_id: str = "",
+    max_age_sec: int = 0,
+    prefer_appid: bool = True,
+) -> Optional[str]:
+    """找最新截图。prefer_appid 时优先该 appid 目录下的图。"""
+    import time as _time
+
+    now = _time.time()
+    files = _iter_steam_screenshot_files(appid=appid, userdata_id=userdata_id)
+    if not files:
+        return None
+
+    scored: List[tuple] = []
+    aid_tokens = set(_appid_dir_names(appid)) if appid else set()
+    for f in files:
+        try:
+            st = os.stat(f)
+        except Exception:  # noqa: BLE001
+            continue
+        if max_age_sec and max_age_sec > 0 and (now - st.st_mtime) > max_age_sec:
+            continue
+        # 太小多半是损坏/占位
+        if st.st_size < 2 * 1024:
+            continue
+        in_app = 0
+        if prefer_appid and aid_tokens:
+            norm = f.replace("\\", "/")
+            if any(f"/{t}/" in norm or norm.endswith(f"/{t}") for t in aid_tokens):
+                in_app = 1
+        scored.append((in_app, st.st_mtime, f))
+
+    if not scored:
+        return None
+    # 先本 appid，再按时间
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return scored[0][2]
+
+
+def capture_display_screenshot(dest: str = "", delay_ms: int = 400) -> Dict[str, Any]:
+    """截取当前屏幕（优先 spectacle），保存为 PNG。"""
+    if not dest:
+        dest = os.path.join(
+            _screenshots_data_dir(),
+            f"capture_{int(__import__('time').time())}.png",
+        )
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    if os.path.isfile(dest):
+        try:
+            os.remove(dest)
+        except Exception:  # noqa: BLE001
+            pass
+
+    spectacle = shutil.which("spectacle")
+    if spectacle:
+        # -b 后台 -n 无通知 -m 当前屏 -o 输出；可选延迟
+        cmd = [
+            spectacle,
+            "-b",
+            "-n",
+            "-m",
+            "-o",
+            dest,
+        ]
+        if delay_ms and delay_ms > 0:
+            cmd.extend(["-d", str(int(delay_ms))])
+        code, err = _run_cmd(cmd, timeout=60)
+        if code == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 1024:
+            return {"success": True, "path": os.path.realpath(dest), "tool": "spectacle"}
+        logger.warning("spectacle capture failed code=%s err=%s", code, err)
+
+    grim = shutil.which("grim")
+    if grim:
+        code, err = _run_cmd([grim, dest], timeout=20)
+        if code == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 1024:
+            return {"success": True, "path": os.path.realpath(dest), "tool": "grim"}
+        logger.warning("grim capture failed: %s", err)
+
+    # 回退：ffmpeg x11grab（桌面模式）。先不写死分辨率，避免外接屏裁错。
+    ffmpeg = shutil.which("ffmpeg")
+    display = os.environ.get("DISPLAY") or ":0"
+    if ffmpeg and display:
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "x11grab",
+            "-i",
+            display,
+            "-frames:v",
+            "1",
+            dest,
+        ]
+        code, err = _run_cmd(cmd, timeout=30)
+        if code == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 1024:
+            return {"success": True, "path": os.path.realpath(dest), "tool": "ffmpeg-x11"}
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "x11grab",
+            "-video_size",
+            "1280x800",
+            "-i",
+            display,
+            "-frames:v",
+            "1",
+            dest,
+        ]
+        code, err = _run_cmd(cmd, timeout=30)
+        if code == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 1024:
+            return {"success": True, "path": os.path.realpath(dest), "tool": "ffmpeg-x11"}
+        logger.warning("ffmpeg capture failed: %s", err)
+
+    return {
+        "success": False,
+        "path": "",
+        "message": (
+            "无法截取屏幕（游戏模式常见）。请在游戏中按 Steam+R1（或 F12）截图后，"
+            "再点「用最新截图设为图标」。"
+        ),
+    }
+
+
+def _update_shortcut_icon_field(
+    userdata_id: str,
+    appid: Any,
+    icon_path: str,
+    key: str = "",
+) -> bool:
+    """把 shortcuts.vdf 里对应项的 icon 字段写成 icon_path。"""
+    root = find_steam_root()
+    if not root or not userdata_id or not icon_path:
+        return False
+    sc_path = os.path.join(root, "userdata", str(userdata_id), "config", "shortcuts.vdf")
+    if not os.path.isfile(sc_path):
+        return False
+    target = normalize_appid(appid)
+    try:
+        with open(sc_path, "rb") as fp:
+            parsed = _read_node(fp)
+        shortcuts = parsed.get("shortcuts") or {}
+        if not isinstance(shortcuts, dict):
+            return False
+        changed = False
+        if key and str(key) in shortcuts and isinstance(shortcuts[str(key)], dict):
+            shortcuts[str(key)]["icon"] = icon_path
+            changed = True
+        else:
+            for _k, entry in shortcuts.items():
+                if not isinstance(entry, dict):
+                    continue
+                if normalize_appid(entry.get("appid")) == target:
+                    entry["icon"] = icon_path
+                    changed = True
+        if changed:
+            write_vdf(sc_path, parsed)
+        return changed
+    except Exception as e:  # noqa: BLE001
+        logger.warning("update shortcut icon failed: %s", e)
+        return False
+
+
+def set_game_icon_from_image(
+    appid: Any,
+    image_path: str,
+    userdata_id: str = "",
+    name: str = "",
+    key: str = "",
+    max_edge: Any = None,
+) -> Dict[str, Any]:
+    """用一张图片（截图）作为该非 Steam 游戏的库图标/封面。
+
+    max_edge: 封面最长边像素；0=原图。列表图标取 min(512, max_edge或256)。
+    """
+    appid_u = normalize_appid(appid)
+    if not appid_u:
+        return {"success": False, "message": "无效 appid"}
+    img = _normalize(image_path) or str(image_path or "").strip()
+    if not img or not os.path.isfile(img):
+        return {"success": False, "message": f"图片不存在: {image_path}"}
+
+    sid = resolve_primary_userdata_id(userdata_id or "")
+    if not sid:
+        return {"success": False, "message": "找不到 Steam 用户目录"}
+
+    if max_edge is None:
+        max_edge = (load_settings() or {}).get("screenshot_max_edge", 768)
+    cap_edge = _normalize_screenshot_max_edge(max_edge, 768)
+    # 列表小图标：有上限，避免过大
+    if cap_edge <= 0:
+        icon_edge = 256
+    else:
+        icon_edge = max(128, min(512, cap_edge))
+
+    info = prepare_steam_icon(
+        img,
+        appid_u,
+        sid,
+        name=name or "",
+        icon_max_edge=icon_edge,
+        capsule_max_edge=cap_edge,
+    )
+    icon_path = info.get("icon") or ""
+    if icon_path:
+        _update_shortcut_icon_field(sid, appid_u, icon_path, key=key)
+
+    ok = bool(info.get("grid_icon") or info.get("grid_capsule") or icon_path)
+    size_txt = "原图" if cap_edge <= 0 else f"最长边 {cap_edge}px"
+    return {
+        "success": ok,
+        "appid": appid_u,
+        "userdata_id": sid,
+        "source": os.path.realpath(img),
+        "icon": icon_path,
+        "grid_icon": info.get("grid_icon") or "",
+        "grid_capsule": info.get("grid_capsule") or "",
+        "logo_removed": bool(info.get("logo_removed")),
+        "max_edge": cap_edge,
+        "icon_max_edge": icon_edge,
+        "message": (
+            f"已用截图设为图标/封面（{size_txt}）。请完全退出 Steam 再打开以刷新显示。"
+            if ok
+            else "写入图标失败，请检查图片格式。"
+        ),
+    }
+
+
+def set_game_icon_from_screenshot(
+    appid: Any,
+    userdata_id: str = "",
+    name: str = "",
+    key: str = "",
+    mode: str = "latest",
+    delay_ms: int = 600,
+    max_age_sec: int = 0,
+    max_edge: Any = None,
+) -> Dict[str, Any]:
+    """截屏或使用最新截图，设为该游戏图标。
+
+    mode:
+      - capture: 立即截取当前屏幕
+      - latest: 使用该 appid / 最近的 Steam 截图
+      - capture_or_latest: 先尝试截屏，失败则用最新截图
+    max_edge: 输出最长边；0=原图；None=读设置
+    """
+    mode = str(mode or "latest").lower().strip()
+    src = ""
+    capture_info: Dict[str, Any] = {}
+
+    if max_edge is None:
+        max_edge = (load_settings() or {}).get("screenshot_max_edge", 768)
+    cap_edge = _normalize_screenshot_max_edge(max_edge, 768)
+
+    if mode in ("capture", "capture_or_latest"):
+        dest = os.path.join(
+            _screenshots_data_dir(),
+            f"app_{normalize_appid(appid)}_{int(__import__('time').time())}.png",
+        )
+        capture_info = capture_display_screenshot(dest, delay_ms=delay_ms)
+        if capture_info.get("success"):
+            src = capture_info.get("path") or ""
+            # 截屏后按尺寸预缩放，减小后续处理体积
+            if src and cap_edge > 0:
+                scaled = os.path.join(
+                    _screenshots_data_dir(),
+                    f"app_{normalize_appid(appid)}_{int(__import__('time').time())}_{cap_edge}.png",
+                )
+                if _ffmpeg_to_png(src, scaled, max_edge=cap_edge):
+                    src = scaled
+                    capture_info["scaled_path"] = scaled
+                    capture_info["max_edge"] = cap_edge
+
+    if not src and mode in ("latest", "capture_or_latest"):
+        src = find_latest_screenshot(
+            appid=appid,
+            userdata_id=userdata_id,
+            max_age_sec=max_age_sec,
+            prefer_appid=True,
+        ) or ""
+        # 「用最新截图」才允许跨游戏取最近一张（Steam+R1 常记到别的 appid）。
+        # capture_or_latest 自动回退时不拿别人的图，避免张冠李戴。
+        if not src and mode == "latest":
+            src = find_latest_screenshot(
+                appid=0,
+                userdata_id=userdata_id,
+                max_age_sec=max_age_sec or 3600,
+                prefer_appid=False,
+            ) or ""
+
+    if not src:
+        msg = capture_info.get("message") if capture_info else ""
+        return {
+            "success": False,
+            "message": msg
+            or "未找到可用截图。请在游戏中按 Steam+R1（或 F12）截一张，再重试「用最新截图设为图标」。",
+            "capture": capture_info,
+            "max_edge": cap_edge,
+        }
+
+    result = set_game_icon_from_image(
+        appid=appid,
+        image_path=src,
+        userdata_id=userdata_id,
+        name=name,
+        key=key,
+        max_edge=cap_edge,
+    )
+    result["capture"] = capture_info
+    result["mode"] = mode
+    result["max_edge"] = cap_edge
+    size_txt = "原图" if cap_edge <= 0 else f"{cap_edge}px"
+    if result.get("success") and capture_info.get("success"):
+        result["message"] = (
+            f"已截屏并设为图标（{capture_info.get('tool') or 'capture'}，{size_txt}）。"
+            "请完全退出 Steam 再打开以刷新。"
+        )
+    elif result.get("success"):
+        result["message"] = (
+            f"已用最新截图设为图标：{os.path.basename(src)}（{size_txt}）。"
+            "请完全退出 Steam 再打开以刷新。"
+        )
+    return result
+
+
+def _steam_console_log_paths() -> List[str]:
+    root = find_steam_root()
+    paths = []
+    if root:
+        paths.append(os.path.join(root, "logs", "console_log.txt"))
+        paths.append(os.path.join(root, "logs", "console-linux.txt"))
+    paths.append(os.path.expanduser("~/.steam/steam/logs/console_log.txt"))
+    paths.append(os.path.expanduser("~/.local/share/Steam/logs/console_log.txt"))
+    # 去重保序
+    out = []
+    seen = set()
+    for p in paths:
+        try:
+            rp = os.path.realpath(p)
+        except Exception:  # noqa: BLE001
+            rp = p
+        if rp not in seen and os.path.isfile(rp):
+            seen.add(rp)
+            out.append(rp)
+    return out
+
+
+def _parse_running_appids_from_steam_log() -> List[int]:
+    """从 Steam 日志解析仍在运行的 AppID（added 且尚未 removed）。"""
+    # appid -> last event: 'added' or 'removed'
+    state: Dict[int, str] = {}
+    # 只读每个日志文件尾部，避免全文件扫描过慢
+    for path in _steam_console_log_paths():
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as fp:
+                if size > 512 * 1024:
+                    fp.seek(-512 * 1024, os.SEEK_END)
+                data = fp.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            continue
+        for line in data.splitlines():
+            # Game process added : AppID 3512505844 "..."
+            m = re.search(r"Game process (added|removed)\s*:\s*AppID\s+(\d+)", line, re.I)
+            if not m:
+                continue
+            kind = m.group(1).lower()
+            try:
+                aid = int(m.group(2))
+            except Exception:  # noqa: BLE001
+                continue
+            state[aid] = "added" if kind == "added" else "removed"
+    running = [a for a, s in state.items() if s == "added"]
+    return running
+
+
+def _cmdline_blob() -> str:
+    """汇总 /proc/*/cmdline 便于匹配 exe 路径。"""
+    parts = []
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fp:
+                    raw = fp.read()
+                if not raw:
+                    continue
+                # \0 分隔
+                text = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+                parts.append(text)
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return "\n".join(parts)
+
+
+def find_running_nonsteam_game() -> Dict[str, Any]:
+    """检测当前正在运行的非 Steam 快捷方式游戏。
+
+    优先级：
+      1) Steam 日志中仍在 running 的非 Steam AppID
+      2) /proc 命令行匹配 shortcuts 的 exe 路径
+    """
+    # 延迟导入避免循环：函数内调用 list 逻辑
+    root = find_steam_root()
+    games: List[Dict[str, Any]] = []
+    if root:
+        userdata = os.path.join(root, "userdata")
+        if os.path.isdir(userdata):
+            for sid in sorted(os.listdir(userdata)):
+                sc_path = os.path.join(userdata, sid, "config", "shortcuts.vdf")
+                if not os.path.isfile(sc_path):
+                    continue
+                try:
+                    with open(sc_path, "rb") as fp:
+                        parsed = _read_node(fp)
+                except Exception:  # noqa: BLE001
+                    continue
+                shortcuts = parsed.get("shortcuts") or {}
+                if not isinstance(shortcuts, dict):
+                    continue
+                for key, entry in shortcuts.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    exe = entry.get("Exe") or ""
+                    if not exe:
+                        continue
+                    name = entry.get("AppName") or ""
+                    appid_raw = entry.get("appid")
+                    try:
+                        appid = int(appid_raw) if appid_raw is not None else compute_appid(exe, name)
+                    except Exception:  # noqa: BLE001
+                        appid = compute_appid(exe, name)
+                    games.append(
+                        {
+                            "appid": normalize_appid(appid),
+                            "name": name,
+                            "exe": exe,
+                            "start_dir": entry.get("StartDir") or "",
+                            "userdata_id": sid,
+                            "key": key,
+                        }
+                    )
+
+    by_appid = {normalize_appid(g["appid"]): g for g in games if g.get("appid")}
+    running_ids = _parse_running_appids_from_steam_log()
+    for aid in reversed(running_ids):  # 更靠后的启动优先
+        u = normalize_appid(aid)
+        if u in by_appid and is_nonsteam_shortcut_appid(u):
+            g = by_appid[u]
+            return {
+                "running": True,
+                "source": "steam_log",
+                "appid": u,
+                "game": g,
+                "message": f"正在运行：{g.get('name') or u}",
+            }
+
+    # 进程匹配（避免 flatpak/python 等通用启动器误报）
+    _GENERIC_EXES = {
+        "flatpak",
+        "python",
+        "python3",
+        "bash",
+        "sh",
+        "zsh",
+        "wine",
+        "wine64",
+        "proton",
+        "reaper",
+        "steam-launch-wrapper",
+        "steam",
+        "gamesoverlayui",
+        "pressure-vessel",
+        "pv-adverb",
+        "bwrap",
+    }
+    blob = _cmdline_blob()
+    blob_l = blob.lower()
+    if blob_l:
+        hits = []
+        for g in games:
+            exe_n = (_normalize(g.get("exe") or "") or "").replace("\\", "/")
+            if not exe_n:
+                continue
+            base = os.path.basename(exe_n).lower()
+            # 通用启动器：要求命令行里同时出现游戏目录或 AppName 片段
+            if base in _GENERIC_EXES or len(base) < 5:
+                start_n = (_normalize(g.get("start_dir") or "") or "").replace("\\", "/").rstrip("/")
+                name = str(g.get("name") or "").strip()
+                score = 0
+                if start_n and len(start_n) >= 12 and start_n.lower() in blob_l:
+                    score += 3
+                if name and len(name) >= 4 and name.lower() in blob_l:
+                    score += 2
+                # flatpak app id 常在 LaunchOptions / 路径中——用 start 或 name 不足则跳过
+                if score < 3:
+                    continue
+                hits.append((score, g))
+                continue
+            # 正常 exe：优先完整路径，其次 basename（且 basename 足够长）
+            full = exe_n.lower()
+            if full and len(full) >= 12 and full in blob_l:
+                hits.append((5, g))
+            elif base and len(base) >= 6 and base in blob_l:
+                # basename 命中给较低分，后面取最高分
+                hits.append((2, g))
+        if hits:
+            hits.sort(key=lambda x: x[0], reverse=True)
+            g = hits[0][1]
+            return {
+                "running": True,
+                "source": "process",
+                "appid": normalize_appid(g.get("appid")),
+                "game": g,
+                "message": f"正在运行：{g.get('name') or g.get('appid')}",
+            }
+
+    return {
+        "running": False,
+        "source": "",
+        "appid": 0,
+        "game": None,
+        "message": "当前没有检测到正在运行的非 Steam 游戏（可在下方列表手动选择）",
+    }
+
+
+def fix_missing_title_logos(userdata_id: str = "") -> Dict[str, Any]:
+    """为库中非 Steam 项删除误写的 _logo.png，恢复详情页名称栏文字。"""
+    root = find_steam_root()
+    if not root:
+        return {"success": False, "message": "找不到 Steam", "removed": 0}
+
+    settings = load_settings()
+    sid = resolve_primary_userdata_id(userdata_id or settings.get("userdata_id") or "")
+    if not sid:
+        return {"success": False, "message": "找不到用户目录", "removed": 0}
+
+    sc_path = os.path.join(root, "userdata", sid, "config", "shortcuts.vdf")
+    if not os.path.isfile(sc_path):
+        return {"success": True, "message": "无 shortcuts", "removed": 0}
+
+    try:
+        with open(sc_path, "rb") as fp:
+            parsed = _read_node(fp)
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "message": str(e), "removed": 0}
+
+    removed = 0
+    details = []
+    for _k, entry in (parsed.get("shortcuts") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        appid = normalize_appid(entry.get("appid"))
+        if not appid:
+            continue
+        if _remove_grid_logo(appid, sid):
+            removed += 1
+            details.append(
+                {
+                    "appid": appid,
+                    "name": entry.get("AppName") or "",
+                }
+            )
+
+    return {
+        "success": True,
+        "removed": removed,
+        "details": details[:80],
+        "message": (
+            f"已删除 {removed} 个误写的 logo，详情页名称栏将显示 AppName 文字。"
+            "请完全退出 Steam 再打开以刷新。"
+            if removed
+            else "未发现需要删除的 logo。"
+        ),
+    }
+
+
 def scan_folder_for_games(
     scan_path: str,
     max_depth: int = 5,
@@ -1121,6 +3058,11 @@ def scan_folder_for_games(
             name = _guess_game_name(exe_n, scan_path)
             score = _score_exe(exe_n, scan_path)
             is_hidden = exe_n in hidden_set
+            is_trouble = _path_has_trouble(exe_n) or _has_trouble_suffix(name)
+            game_folder = _resolve_game_folder(exe_n, scan_path)
+            icon_path = find_icon_for_exe(exe_n, start) or ""
+            # 前端直接用 data URL 画图（file:// 在 Decky/CEF 里通常显示不了）
+            icon_data_url = load_icon_data_url(icon_path) if icon_path else ""
             found.append(
                 {
                     "id": f"{score}:{exe_n}",
@@ -1131,6 +3073,11 @@ def scan_folder_for_games(
                     "score": score,
                     "already_added": exe_n in existing,
                     "hidden": is_hidden,
+                    "trouble": is_trouble,
+                    "game_folder": game_folder,
+                    "icon": icon_path,
+                    "has_icon": bool(icon_path),
+                    "icon_data_url": icon_data_url,
                     "rel_dir": os.path.relpath(os.path.dirname(exe_n), scan_path),
                 }
             )
@@ -1151,8 +3098,19 @@ def scan_folder_for_games(
         visible = pruned
         hidden_only = [x for x in pruned if x.get("hidden")]
 
-    visible.sort(key=lambda x: (x["already_added"], -x["score"], x["name"].lower()))
-    hidden_only.sort(key=lambda x: (-x["score"], x["name"].lower()))
+    # 问题项靠后排，方便先处理正常候选
+    visible.sort(
+        key=lambda x: (
+            bool(x.get("trouble")),
+            x["already_added"],
+            -x["score"],
+            x["name"].lower(),
+        )
+    )
+    hidden_only.sort(
+        key=lambda x: (bool(x.get("trouble")), -x["score"], x["name"].lower())
+    )
+    trouble_count = sum(1 for x in pruned if x.get("trouble"))
 
     return {
         "games": visible[:300],
@@ -1160,6 +3118,7 @@ def scan_folder_for_games(
         "extract": extract_info,
         "scan_path": scan_path,
         "hidden_count_settings": len(hidden_set),
+        "trouble_count": trouble_count,
     }
 
 
@@ -1233,15 +3192,26 @@ def add_games_to_steam(
         if not isinstance(raw, dict):
             continue
         exe_path = _normalize(raw.get("exe") or "")
-        name = str(raw.get("name") or "").strip()
         start = _normalize(raw.get("start_dir") or "") or (
             os.path.dirname(exe_path) if exe_path else ""
         )
         if not exe_path or not os.path.isfile(exe_path):
             skipped.append({"exe": raw.get("exe"), "reason": "文件不存在"})
             continue
-        if not name:
-            name = os.path.splitext(os.path.basename(exe_path))[0]
+        # 显示名：始终按文件夹名，不用 exe 文件名（即使前端传了 exe 名也覆盖）
+        settings_scan = str((load_settings() or {}).get("scan_path") or "")
+        folder_name = _guess_game_name(exe_path, settings_scan or start)
+        raw_name = str(raw.get("name") or "").strip()
+        exe_stem = os.path.splitext(os.path.basename(exe_path))[0]
+        # 若传入名几乎等于 exe 主名，改用文件夹名
+        if not raw_name or raw_name.lower() == exe_stem.lower() or raw_name.endswith(".exe"):
+            name = folder_name or raw_name or exe_stem
+        else:
+            # 前端扫描已给出文件夹名时保留
+            name = raw_name or folder_name or exe_stem
+        # 再保险：若最终仍是 exe 主名且文件夹名不同，强制用文件夹
+        if folder_name and name.lower() == exe_stem.lower() and folder_name.lower() != exe_stem.lower():
+            name = folder_name
         if exe_path in existing_exes:
             skipped.append({"exe": exe_path, "name": name, "reason": "已在库中"})
             continue
@@ -1250,12 +3220,31 @@ def add_games_to_steam(
         steamexe = _format_exe_for_steam(exe_path)
         steamdir = _format_startdir_for_steam(start)
 
+        # 图标：优先用前端传入，否则自动在启动器旁查找
+        icon_src = str(raw.get("icon") or "").strip()
+        if icon_src:
+            icon_src = _normalize(icon_src) or icon_src
+        if not icon_src or not os.path.isfile(icon_src):
+            icon_src = find_icon_for_exe(exe_path, start) or ""
+
+        if icon_src:
+            icon_info = prepare_steam_icon(icon_src, appid, sid, name=name)
+        else:
+            # 无图标也清掉误写 logo，保证详情页显示名称
+            icon_info = {
+                "icon": "",
+                "grid_icon": "",
+                "source": "",
+                "logo_removed": _remove_grid_logo(appid, sid),
+            }
+        steam_icon = icon_info.get("icon") or ""
+
         entry = {
             "appid": appid_to_steam_int32(appid),
             "AppName": name,
             "Exe": steamexe,
             "StartDir": steamdir,
-            "icon": "",
+            "icon": steam_icon,
             "ShortcutPath": "",
             "LaunchOptions": "",
             "IsHidden": 0,
@@ -1281,6 +3270,10 @@ def add_games_to_steam(
                 "exe": steamexe,
                 "start_dir": steamdir,
                 "userdata_id": sid,
+                "icon": steam_icon,
+                "icon_source": icon_info.get("source") or "",
+                "grid_icon": icon_info.get("grid_icon") or "",
+                "has_icon": bool(steam_icon),
             }
         )
 
@@ -1356,6 +3349,33 @@ class Plugin:
             return {"success": False, "message": "exes 必须是路径数组"}
         return unhide_exes(exes)
 
+    async def mark_scan_items_trouble(self, exes: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """将勾选启动项的游戏文件夹重命名为 xxx-trouble（不删除）。"""
+        if isinstance(exes, dict):
+            kwargs = {**exes, **kwargs}
+            exes = kwargs.get("exes")
+        if exes is None:
+            exes = kwargs.get("exes") or []
+        if not isinstance(exes, list):
+            return {"success": False, "message": "exes 必须是路径数组", "done": [], "skipped": []}
+        mark = kwargs.get("mark", True)
+        if isinstance(mark, str):
+            mark = mark.lower() not in ("0", "false", "no", "off")
+        scan_path = str(kwargs.get("scan_path") or "")
+        return mark_games_trouble(exes, scan_root=scan_path, mark=bool(mark))
+
+    async def unmark_scan_items_trouble(self, exes: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """去掉游戏文件夹的 -trouble 后缀。"""
+        if isinstance(exes, dict):
+            kwargs = {**exes, **kwargs}
+            exes = kwargs.get("exes")
+        if exes is None:
+            exes = kwargs.get("exes") or []
+        if not isinstance(exes, list):
+            return {"success": False, "message": "exes 必须是路径数组", "done": [], "skipped": []}
+        scan_path = str(kwargs.get("scan_path") or "")
+        return mark_games_trouble(exes, scan_root=scan_path, mark=False)
+
     async def get_hidden_scan_items(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
         s = load_settings()
         hidden = s.get("hidden_exes") or []
@@ -1419,6 +3439,9 @@ class Plugin:
         parts = [f"扫描到 {len(games)} 个启动器"]
         if hidden_games:
             parts.append(f"隐藏栏 {len(hidden_games)} 个")
+        tc = result.get("trouble_count") or sum(1 for g in games if g.get("trouble"))
+        if tc:
+            parts.append(f"问题标记(-trouble) {tc} 个")
         if extract:
             ec = extract.get("extracted_count") or 0
             fc = extract.get("failed_count") or 0
@@ -1435,6 +3458,7 @@ class Plugin:
             "max_depth": depth,
             "auto_extract": bool(auto_extract),
             "extract_depth": extract_depth,
+            "trouble_count": tc,
         }
 
     async def add_non_steam_games(self, entries: Any = None, userdata_id: str = "", **kwargs: Any) -> Dict[str, Any]:
@@ -1446,7 +3470,240 @@ class Plugin:
             entries = kwargs.get("entries") or []
         if not isinstance(entries, list):
             return {"success": False, "message": "entries 必须是数组", "added": [], "skipped": []}
-        return add_games_to_steam(entries, userdata_id=str(userdata_id or kwargs.get("userdata_id") or ""))
+        result = add_games_to_steam(entries, userdata_id=str(userdata_id or kwargs.get("userdata_id") or ""))
+        # 补充提示：有多少项写入了 Steam 图标
+        if result.get("success") and result.get("added"):
+            with_icon = sum(1 for a in result["added"] if a.get("has_icon") or a.get("icon"))
+            result["message"] = (
+                result.get("message")
+                or f"已添加 {len(result['added'])} 个"
+            ) + f" 其中 {with_icon} 个已写入库图标；请完全退出 Steam 再打开以刷新。"
+        return result
+
+    async def get_cjk_font_lang_options(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """返回「修复汉化字体」支持的语言列表。"""
+        opts = [
+            {"id": k, "label": v.get("label", k)}
+            for k, v in CJK_LANG_PRESETS.items()
+        ]
+        return {"success": True, "options": opts, "default": "zh_CN"}
+
+    async def repair_cjk_fonts(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """修复汉化字体（批量或单个）。
+
+        参数（均可放在 dict 位置参数或 kwargs 中）:
+          - lang: zh_CN | ja_JP | zh_TW（默认 zh_CN）
+          - appid / appids: 指定单个或多个；为空则处理全部非 Steam 游戏
+          - userdata_id / key / name: 单修时可选，便于精确写启动项
+          - only_with_prefix: 仅处理已有 compatdata 的项
+        """
+        if isinstance(_arg, dict):
+            kwargs = {**_arg, **kwargs}
+        lang = str(kwargs.get("lang") or "zh_CN")
+        only_with_prefix = bool(kwargs.get("only_with_prefix", False))
+        appid = kwargs.get("appid")
+        appids = kwargs.get("appids")
+        userdata_id = str(kwargs.get("userdata_id") or "")
+        key = str(kwargs.get("key") if kwargs.get("key") is not None else "")
+        name = str(kwargs.get("name") or "")
+
+        # 单游戏
+        if appid is not None and appid != "" and not appids:
+            return repair_cjk_fonts_for_game(
+                appid=appid,
+                userdata_id=userdata_id,
+                key=key,
+                name=name,
+                lang=lang,
+                collect_prefix_dirs=_collect_prefix_dirs,
+                find_steam_root=find_steam_root,
+                normalize_appid=normalize_appid,
+                read_node=_read_node,
+                write_vdf=write_vdf,
+            )
+
+        games = await self.get_non_steam_games()
+        id_list = None
+        if appids is not None:
+            if isinstance(appids, list):
+                id_list = appids
+            else:
+                id_list = [appids]
+        elif appid is not None and appid != "":
+            id_list = [appid]
+
+        return repair_cjk_fonts_batch(
+            appids=id_list,
+            lang=lang,
+            only_with_prefix=only_with_prefix,
+            games=games,
+            collect_prefix_dirs=_collect_prefix_dirs,
+            find_steam_root=find_steam_root,
+            normalize_appid=normalize_appid,
+            read_node=_read_node,
+            write_vdf=write_vdf,
+        )
+
+    async def repair_nonsteam_icons(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """为已在库中的非 Steam 游戏补写 grid 图标（从 exe/旁路图标提取）。"""
+        games = await self.get_non_steam_games()
+        fixed = []
+        skipped = []
+        for g in games:
+            exe = g.get("exe") or ""
+            start = g.get("start_dir") or ""
+            appid = normalize_appid(g.get("appid"))
+            sid = str(g.get("userdata_id") or "")
+            if not appid or not sid:
+                skipped.append({"name": g.get("name"), "reason": "no_appid"})
+                continue
+            gname = str(g.get("name") or "")
+            icon_src = find_icon_for_exe(exe, start) or ""
+            if not icon_src:
+                # 即使没图标也删掉误写 logo，恢复详情页名称
+                if _remove_grid_logo(appid, sid):
+                    fixed.append(
+                        {
+                            "name": gname,
+                            "appid": appid,
+                            "icon": "",
+                            "grid_icon": "",
+                            "logo_removed": True,
+                        }
+                    )
+                else:
+                    skipped.append({"name": gname, "reason": "no_icon_source"})
+                continue
+            info = prepare_steam_icon(icon_src, appid, sid, name=gname)
+            # 同步写回 shortcuts.vdf 的 icon 字段
+            if info.get("icon"):
+                try:
+                    root = find_steam_root()
+                    sc_path = os.path.join(root, "userdata", sid, "config", "shortcuts.vdf")
+                    if os.path.isfile(sc_path):
+                        with open(sc_path, "rb") as fp:
+                            parsed = _read_node(fp)
+                        shortcuts = parsed.get("shortcuts") or {}
+                        key = str(g.get("key") if g.get("key") is not None else "")
+                        if key in shortcuts and isinstance(shortcuts[key], dict):
+                            shortcuts[key]["icon"] = info["icon"]
+                            write_vdf(sc_path, parsed)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("update shortcut icon field failed: %s", e)
+            fixed.append(
+                {
+                    "name": gname,
+                    "appid": appid,
+                    "icon": info.get("icon"),
+                    "grid_icon": info.get("grid_icon"),
+                    "logo_removed": bool(info.get("logo_removed")),
+                }
+            )
+        return {
+            "success": True,
+            "fixed_count": len(fixed),
+            "skipped_count": len(skipped),
+            "fixed": fixed[:50],
+            "skipped": skipped[:50],
+            "message": (
+                f"已为 {len(fixed)} 个非 Steam 项补写图标（并清除会遮挡名称的 logo），"
+                f"跳过 {len(skipped)} 个。请完全退出 Steam 再打开。"
+            ),
+        }
+
+    async def fix_game_page_titles(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """删除误写的 _logo.png，恢复 Steam 游戏详情页名称栏文字。"""
+        userdata_id = ""
+        if isinstance(_arg, dict):
+            kwargs = {**_arg, **kwargs}
+        userdata_id = str(kwargs.get("userdata_id") or "")
+        return fix_missing_title_logos(userdata_id=userdata_id)
+
+    async def set_icon_from_screenshot(self, appid: Any = 0, **kwargs: Any) -> Dict[str, Any]:
+        """截屏或用最新截图，设为指定非 Steam 游戏的库图标。
+
+        参数（均可放 kwargs）:
+          appid, userdata_id, name, key,
+          mode: capture | latest | capture_or_latest
+          delay_ms, max_age_sec,
+          max_edge / screenshot_max_edge: 输出最长边(0=原图)，并写入设置
+        """
+        if isinstance(appid, dict):
+            kwargs = {**appid, **kwargs}
+            appid = kwargs.get("appid", 0)
+        try:
+            aid = normalize_appid(kwargs.get("appid", appid) or 0)
+        except Exception:  # noqa: BLE001
+            aid = 0
+        if not aid:
+            return {"success": False, "message": "缺少 appid"}
+
+        # 尽量补全 name / userdata_id / key
+        games = await self.get_non_steam_games()
+        match = None
+        for g in games:
+            if normalize_appid(g.get("appid")) == aid:
+                match = g
+                break
+        sid = str(kwargs.get("userdata_id") or (match or {}).get("userdata_id") or "")
+        name = str(kwargs.get("name") or (match or {}).get("name") or "")
+        key = str(kwargs.get("key") if kwargs.get("key") is not None else (match or {}).get("key") or "")
+        mode = str(kwargs.get("mode") or "capture_or_latest")
+        try:
+            delay_ms = int(kwargs.get("delay_ms", 600) or 600)
+        except Exception:  # noqa: BLE001
+            delay_ms = 600
+        try:
+            max_age_sec = int(kwargs.get("max_age_sec", 0) or 0)
+        except Exception:  # noqa: BLE001
+            max_age_sec = 0
+
+        # 尺寸：优先本次参数，否则用已保存设置
+        max_edge = kwargs.get("max_edge", kwargs.get("screenshot_max_edge", None))
+        if max_edge is not None:
+            max_edge = _normalize_screenshot_max_edge(max_edge, 768)
+            try:
+                save_settings({"screenshot_max_edge": max_edge})
+            except Exception as e:  # noqa: BLE001
+                logger.warning("save screenshot_max_edge failed: %s", e)
+
+        result = set_game_icon_from_screenshot(
+            appid=aid,
+            userdata_id=sid,
+            name=name,
+            key=key,
+            mode=mode,
+            delay_ms=delay_ms,
+            max_age_sec=max_age_sec,
+            max_edge=max_edge,
+        )
+        logger.info(
+            "set_icon_from_screenshot appid=%s mode=%s edge=%s ok=%s src=%s",
+            aid,
+            mode,
+            result.get("max_edge"),
+            result.get("success"),
+            result.get("source") or (result.get("capture") or {}).get("path"),
+        )
+        return result
+
+    async def capture_and_set_icon(self, appid: Any = 0, **kwargs: Any) -> Dict[str, Any]:
+        """立即截屏并设为当前游戏图标（mode=capture）。"""
+        if isinstance(appid, dict):
+            kwargs = {**appid, **kwargs}
+            appid = kwargs.get("appid", 0)
+        kwargs["mode"] = "capture"
+        return await self.set_icon_from_screenshot(appid=appid, **kwargs)
+
+    async def set_icon_from_latest_screenshot(self, appid: Any = 0, **kwargs: Any) -> Dict[str, Any]:
+        """用最新截图设为当前游戏图标（mode=latest）。"""
+        if isinstance(appid, dict):
+            kwargs = {**appid, **kwargs}
+            appid = kwargs.get("appid", 0)
+        kwargs["mode"] = "latest"
+        if "max_age_sec" not in kwargs:
+            kwargs["max_age_sec"] = 0
+        return await self.set_icon_from_screenshot(appid=appid, **kwargs)
 
     async def find_missing_nonsteam_games(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
         """检测库中非 Steam 游戏的启动文件是否还存在。"""
@@ -1573,54 +3830,86 @@ class Plugin:
 
     # ---- 列出所有非 Steam 游戏 ----
     async def get_non_steam_games(self) -> List[Dict[str, Any]]:
-        root = find_steam_root()
-        if not root:
-            return []
-        results: List[Dict[str, Any]] = []
-        userdata = os.path.join(root, "userdata")
-        if not os.path.isdir(userdata):
-            return []
+        return list_all_nonsteam_games()
 
-        for sid in sorted(os.listdir(userdata)):
-            sc_path = os.path.join(userdata, sid, "config", "shortcuts.vdf")
-            if not os.path.isfile(sc_path):
-                continue
-            try:
-                with open(sc_path, "rb") as fp:
-                    parsed = _read_node(fp)
-            except Exception as e:  # noqa: BLE001
-                logger.error("解析 shortcuts 失败 %s: %s", sc_path, e)
-                continue
+    async def get_plugin_status(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """面板顶部状态：Steam 是否在跑、库数量、重复项。"""
+        games = list_all_nonsteam_games()
+        dups = find_duplicate_nonsteam_groups(games)
+        return {
+            "success": True,
+            "steam_running": is_steam_running(),
+            "game_count": len(games),
+            "duplicate_groups": dups.get("count") or 0,
+            "message": (
+                "Steam 正在运行，改库后请完全退出再打开。"
+                if is_steam_running()
+                else "Steam 未在运行。"
+            ),
+        }
 
-            shortcuts = parsed.get("shortcuts", {})
-            if not isinstance(shortcuts, dict):
+    async def find_duplicate_nonsteam_games(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        return find_duplicate_nonsteam_groups()
+
+    async def purge_duplicate_shortcuts(
+        self,
+        _arg: Any = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """每组 same_exe 重复项只保留一条快捷方式（不删文件）。"""
+        if isinstance(_arg, dict):
+            kwargs = {**_arg, **kwargs}
+        keep_first = bool(kwargs.get("keep_first", True))
+        groups = find_duplicate_nonsteam_groups().get("groups") or []
+        removed: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for grp in groups:
+            if grp.get("reason") != "same_exe":
                 continue
-            for key, entry in shortcuts.items():
-                if not isinstance(entry, dict):
+            items = list(grp.get("games") or [])
+            if len(items) < 2:
+                continue
+            # 保留第一条（key 较小的优先）
+            items.sort(key=lambda x: (str(x.get("key") or ""), normalize_appid(x.get("appid"))))
+            keep = items[0] if keep_first else items[-1]
+            for item in items:
+                if item is keep:
                     continue
-                exe = entry.get("Exe") or ""
-                if not exe:
-                    continue
-                name = entry.get("AppName") or ""
-                appid_raw = entry.get("appid")
-                if appid_raw is not None:
-                    try:
-                        appid = int(appid_raw)
-                    except (TypeError, ValueError):
-                        appid = compute_appid(exe, name)
-                else:
-                    appid = compute_appid(exe, name)
-                results.append(
-                    {
-                        "appid": normalize_appid(appid),
-                        "name": name,
-                        "exe": exe,
-                        "start_dir": entry.get("StartDir") or "",
-                        "userdata_id": sid,
-                        "key": key,
-                    }
-                )
-        return results
+                if normalize_appid(item.get("appid")) == normalize_appid(keep.get("appid")):
+                    if str(item.get("key")) == str(keep.get("key")):
+                        continue
+                try:
+                    rm = remove_shortcuts_from_steam(
+                        userdata_id=str(item.get("userdata_id") or ""),
+                        key=str(item.get("key") if item.get("key") is not None else ""),
+                        appid=0,
+                        exe="",
+                        name="",
+                    )
+                    if rm.get("removed"):
+                        removed.append(
+                            {
+                                "name": item.get("name"),
+                                "appid": normalize_appid(item.get("appid")),
+                                "kept": keep.get("appid"),
+                            }
+                        )
+                    else:
+                        failed.append({"name": item.get("name"), "message": rm.get("message")})
+                except Exception as e:  # noqa: BLE001
+                    failed.append({"name": item.get("name"), "error": str(e)})
+        return {
+            "success": True,
+            "removed_count": len(removed),
+            "failed_count": len(failed),
+            "removed": removed,
+            "failed": failed,
+            "message": (
+                f"已移除 {len(removed)} 条重复快捷方式（文件未删）"
+                + (f"，失败 {len(failed)} 条" if failed else "")
+                + "。请完全退出 Steam 再打开。"
+            ),
+        }
 
     async def get_game_by_appid(self, appid: int = 0, **kwargs: Any) -> Optional[Dict[str, Any]]:
         """按 appid 查找非 Steam 游戏（供库页面/右键菜单调用）。"""
@@ -1634,6 +3923,29 @@ class Plugin:
             if normalize_appid(g.get("appid")) == target:
                 return g
         return None
+
+    async def get_running_nonsteam_game(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """检测当前是否有非 Steam 游戏在运行（供左侧插件截图设图标用）。"""
+        return find_running_nonsteam_game()
+
+    async def list_nonsteam_for_icon(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """列出库中非 Steam 游戏 + 当前运行项（左侧插件选择目标）。"""
+        games = await self.get_non_steam_games()
+        running = find_running_nonsteam_game()
+        # 名称排序，运行中的置顶
+        run_id = normalize_appid((running.get("game") or {}).get("appid")) if running.get("running") else 0
+        def _key(g: Dict[str, Any]):
+            aid = normalize_appid(g.get("appid"))
+            return (0 if aid and aid == run_id else 1, str(g.get("name") or "").lower())
+        games_sorted = sorted(games, key=_key)
+        settings = load_settings()
+        return {
+            "success": True,
+            "games": games_sorted,
+            "count": len(games_sorted),
+            "running": running,
+            "screenshot_max_edge": settings.get("screenshot_max_edge", 768),
+        }
 
     # ---- 计算将要删除的目标路径 ----
     def _compute_targets(
@@ -1662,16 +3974,23 @@ class Plugin:
             start = _normalize(game.get("start_dir", "") or "")
             logger.info("compute body paths exe=%s start=%s", exe, start)
 
-            # StartDir：仅当它足够“像游戏目录”时才整目录删除
-            if start and os.path.isdir(start) and _safe_to_delete(start):
+            shared = start_dir_shared_with_others(start, appid) if start else []
+            # StartDir：仅当它足够“像游戏目录”且不被其它快捷方式共用时才整目录删除
+            if start and os.path.isdir(start) and _safe_to_delete(start) and not shared:
                 targets.append(start)
+            elif shared:
+                logger.warning(
+                    "start dir shared with %s, will not rmtree: %s",
+                    [s.get("name") for s in shared[:4]],
+                    start,
+                )
             # 可执行文件：始终尝试（若已在 start 目录内则不必重复）
             if exe and os.path.exists(exe) and _safe_to_delete(exe):
                 if not start or not exe.startswith(start.rstrip("/") + "/"):
                     if exe not in targets:
                         targets.append(exe)
                 elif start not in targets:
-                    # start 未加入（不安全）时至少删 exe
+                    # start 未加入（不安全或共用）时至少删 exe
                     targets.append(exe)
             elif exe:
                 logger.warning("exe 不存在或不可删: %s", exe)
@@ -1740,12 +4059,31 @@ class Plugin:
         }
         targets = self._compute_targets(game, delete_body, delete_saves, delete_shader)
         existing = [t for t in targets if os.path.lexists(t)]
+        start_n = _normalize(start_dir or "")
+        shared = start_dir_shared_with_others(start_n, game["appid"]) if start_n else []
+        running = find_running_nonsteam_game()
+        game_running = bool(
+            running.get("running")
+            and normalize_appid(running.get("appid")) == game["appid"]
+        )
+        warnings: List[str] = []
+        if is_steam_running():
+            warnings.append("Steam 正在运行：写入 shortcuts 后请完全退出再打开，否则库列表可能被缓存盖回。")
+        if game_running:
+            warnings.append("该游戏似乎仍在运行，建议先退出再删，否则文件可能删不干净。")
+        if shared:
+            names = "、".join(str(s.get("name") or s.get("appid")) for s in shared[:4])
+            warnings.append(f"启动目录与其它快捷方式共用（{names}），将只删本游戏 exe，不删整个目录。")
         return {
             "targets": targets,
             "existing": existing,
             "normalized_exe": _normalize(exe or ""),
-            "normalized_start": _normalize(start_dir or ""),
+            "normalized_start": start_n,
             "appid": game["appid"],
+            "steam_running": is_steam_running(),
+            "game_running": game_running,
+            "shared_startdir": [s.get("name") for s in shared],
+            "warnings": warnings,
         }
 
     async def delete_non_steam_game(
