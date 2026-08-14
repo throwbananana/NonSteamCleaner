@@ -59,7 +59,6 @@ const getCjkFontLangOptions = callable('get_cjk_font_lang_options');
 const setIconFromScreenshot = callable('set_icon_from_screenshot');
 const captureAndSetIcon = callable('capture_and_set_icon');
 const setIconFromLatestScreenshot = callable('set_icon_from_latest_screenshot');
-const listNonsteamForIcon = callable('list_nonsteam_for_icon');
 const listRecentScreenshots = callable('list_recent_screenshots');
 const getRunningNonsteamGame = callable('get_running_nonsteam_game');
 const getPluginStatus = callable('get_plugin_status');
@@ -1587,6 +1586,9 @@ function PluginPanelInner() {
   const ButtonItem = DFL.ButtonItem;
   // 注意：DFL.TextField 在 openFilePicker 返回后容易触发 SteamUI 渲染崩溃，改用原生 input
 
+  const rootRef = React.useRef<HTMLDivElement | null>(null);
+  const [activeTab, setActiveTab] = React.useState<'clean' | 'scan' | 'icon' | 'font'>('clean');
+
   const [scanPath, setScanPath] = React.useState('/home/deck/Downloads');
   const [maxDepth, setMaxDepth] = React.useState(5);
   const [loading, setLoading] = React.useState(false);
@@ -1617,7 +1619,6 @@ function PluginPanelInner() {
   const [cjkStatus, setCjkStatus] = React.useState('');
 
   // 左侧插件：截图设为图标
-  const [iconLibGames, setIconLibGames] = React.useState<NonSteamGame[]>([]);
   const [iconTargetAppid, setIconTargetAppid] = React.useState<number>(0);
   const [iconRunningMsg, setIconRunningMsg] = React.useState('');
   const [iconShotSize, setIconShotSize] = React.useState(768);
@@ -1659,37 +1660,10 @@ function PluginPanelInner() {
     }
   }, [iconTargetAppid]);
 
-  const refreshIconTargets = React.useCallback(async () => {
-    setIconListLoading(true);
-    try {
-      const r = unwrapResult(await listNonsteamForIcon({})) || {};
-      const list: NonSteamGame[] = (r.games || []) as NonSteamGame[];
-      setIconLibGames(list);
-      if (r.screenshot_max_edge === 0 || r.screenshot_max_edge) {
-        const v = Number(r.screenshot_max_edge);
-        if (!Number.isNaN(v)) setIconShotSize(v);
-      }
-      const running = r.running || {};
-      if (running.running && running.game) {
-        const aid = Number(running.game.appid || running.appid || 0);
-        setIconTargetAppid(aid);
-        setIconRunningMsg(running.message || `正在运行：${running.game.name || aid}`);
-      } else {
-        setIconRunningMsg(running.message || '未检测到正在运行的非 Steam 游戏');
-        // 若当前选择为空，默认选第一项
-        setIconTargetAppid((prev) => {
-          if (prev && list.some((g) => Number(g.appid) === prev)) return prev;
-          return list.length ? Number(list[0].appid) : 0;
-        });
-      }
-    } catch (e) {
-      setIconRunningMsg('加载游戏列表失败: ' + String(e));
-    } finally {
-      setIconListLoading(false);
-    }
-  }, []);
-
+  // 已入库非 Steam 游戏列表：截图设图标 / 清理 / 重复快捷方式三处共用同一份，
+  // 避免重复请求（原先各自独立调用 list_nonsteam_for_icon / get_non_steam_games）
   const refreshLibAndStatus = React.useCallback(async () => {
+    setIconListLoading(true);
     try {
       const st = unwrapResult(await getPluginStatus({})) || {};
       setSteamRunning(!!st.steam_running);
@@ -1704,21 +1678,29 @@ function PluginPanelInner() {
         if (prev && arr.some((g) => Number(g.appid) === prev)) return prev;
         return arr.length ? Number(arr[0].appid) : 0;
       });
+      setIconTargetAppid((prev) => {
+        if (prev && arr.some((g) => Number(g.appid) === prev)) return prev;
+        return arr.length ? Number(arr[0].appid) : 0;
+      });
     } catch (e) {
       LOG('list lib games', e);
+    } finally {
+      setIconListLoading(false);
     }
   }, []);
 
   React.useEffect(() => {
-    void refreshIconTargets();
     void refreshLibAndStatus();
     void refreshShotList();
-  }, [refreshIconTargets, refreshLibAndStatus, refreshShotList]);
+  }, [refreshLibAndStatus, refreshShotList]);
 
-  // alwaysRender 时面板只挂载一次；开游戏后再进 QAM 必须轮询，否则一直显示「未检测到」
+  // alwaysRender 时面板只挂载一次；开游戏后再进 QAM 必须轮询，否则一直显示「未检测到」。
+  // 但同一原因也导致这个定时器在 QAM 关闭时仍然常驻后台——用 rootRef 的 offsetParent
+  // 判断面板此刻是否真的显示在屏幕上，不可见时跳过 RPC，只留一个空转的计时器。
   React.useEffect(() => {
     let cancelled = false;
     const tick = async () => {
+      if (!rootRef.current || rootRef.current.offsetParent === null) return;
       try {
         const running = unwrapResult(await getRunningNonsteamGame({})) || {};
         if (cancelled) return;
@@ -1750,7 +1732,7 @@ function PluginPanelInner() {
       return;
     }
     const g =
-      iconLibGames.find((x) => Number(x.appid) === Number(iconTargetAppid)) || null;
+      libGames.find((x) => Number(x.appid) === Number(iconTargetAppid)) || null;
     setIconBusy(true);
     const sizeTxt = iconShotSize <= 0 ? '原图' : `${iconShotSize}px`;
     setIconStatus(
@@ -2102,14 +2084,25 @@ function PluginPanelInner() {
 
   const iconSizeLabel = iconShotSize <= 0 ? '原图' : `${iconShotSize}px`;
   const selectedIconGame =
-    iconLibGames.find((g) => Number(g.appid) === Number(iconTargetAppid)) || null;
+    libGames.find((g) => Number(g.appid) === Number(iconTargetAppid)) || null;
 
   const selectedLibGame =
     libGames.find((g) => Number(g.appid) === Number(libTarget)) || null;
 
   return React.createElement(
     'div',
-    { style: { padding: '0 0 16px 0' } },
+    { style: { padding: '0 0 16px 0' }, ref: rootRef },
+    React.createElement(ChipRow, {
+      items: [
+        { id: 'clean', label: '清理' },
+        { id: 'scan', label: '扫描添加' },
+        { id: 'icon', label: '图标' },
+        { id: 'font', label: '汉化字体' },
+      ],
+      value: activeTab,
+      onChange: (id: string) => setActiveTab(id as 'clean' | 'scan' | 'icon' | 'font'),
+    }),
+    React.createElement('div', { style: { height: 10 } }),
     steamRunning
       ? React.createElement(
           PanelSection,
@@ -2134,7 +2127,7 @@ function PluginPanelInner() {
         )
       : null,
     // -------- 已入库游戏：注入失败时的备用清理入口 --------
-    React.createElement(
+    activeTab === 'clean' && React.createElement(
       PanelSection,
       { title: `已入库非 Steam（${libGames.length}）` },
       React.createElement(
@@ -2239,7 +2232,7 @@ function PluginPanelInner() {
       )
     ),
     // -------- 截图设为图标（左侧插件主入口，游戏中可开 QAM 使用）--------
-    React.createElement(
+    activeTab === 'icon' && React.createElement(
       PanelSection,
       { title: '截图设为图标' },
       React.createElement(
@@ -2281,7 +2274,7 @@ function PluginPanelInner() {
           '目标游戏',
           selectedIconGame
             ? `：${selectedIconGame.name || selectedIconGame.appid}`
-            : iconLibGames.length
+            : libGames.length
               ? ''
               : '（库中暂无非 Steam 游戏）'
         ),
@@ -2289,7 +2282,7 @@ function PluginPanelInner() {
           'select',
           {
             value: String(iconTargetAppid || ''),
-            disabled: iconBusy || !iconLibGames.length,
+            disabled: iconBusy || !libGames.length,
             onChange: (e: any) => setIconTargetAppid(Number(e.target.value) || 0),
             style: {
               width: '100%',
@@ -2301,8 +2294,8 @@ function PluginPanelInner() {
               fontSize: 13,
             },
           },
-          iconLibGames.length
-            ? iconLibGames.map((g) =>
+          libGames.length
+            ? libGames.map((g) =>
                 React.createElement(
                   'option',
                   { key: String(g.appid) + ':' + String(g.key), value: String(g.appid) },
@@ -2516,7 +2509,7 @@ function PluginPanelInner() {
             {
               style: btnStyle(),
               disabled: iconBusy || iconListLoading,
-              onClick: () => void refreshIconTargets(),
+              onClick: () => void refreshLibAndStatus(),
             },
             iconListLoading ? '刷新中…' : '刷新游戏列表 / 检测运行中'
           )
@@ -2535,7 +2528,7 @@ function PluginPanelInner() {
         : null
     ),
     // -------- 失效清理 --------
-    React.createElement(
+    activeTab === 'clean' && React.createElement(
       PanelSection,
       { title: '清理失效非 Steam 游戏' },
       React.createElement(
@@ -2693,7 +2686,7 @@ function PluginPanelInner() {
         : null
     ),
     // -------- 扫描添加 --------
-    React.createElement(
+    activeTab === 'scan' && React.createElement(
       PanelSection,
       { title: '扫描并添加非 Steam 游戏' },
       React.createElement(
@@ -2893,7 +2886,7 @@ function PluginPanelInner() {
         )
       )
     ),
-    React.createElement(
+    activeTab === 'scan' && React.createElement(
       PanelSection,
       { title: `候选列表 (${visibleGames.length})` },
       React.createElement(
@@ -3037,7 +3030,7 @@ function PluginPanelInner() {
       )
     ),
     // -------- 隐藏栏 --------
-    React.createElement(
+    activeTab === 'scan' && React.createElement(
       PanelSection,
       { title: `隐藏栏 (${hiddenGames.length})` },
       React.createElement(
@@ -3165,7 +3158,7 @@ function PluginPanelInner() {
             )
           )
     ),
-    React.createElement(
+    activeTab === 'icon' && React.createElement(
       PanelSection,
       { title: '库图标' },
       React.createElement(
@@ -3225,7 +3218,7 @@ function PluginPanelInner() {
       )
     ),
     // -------- 重复快捷方式 --------
-    React.createElement(
+    activeTab === 'clean' && React.createElement(
       PanelSection,
       { title: '重复快捷方式' },
       React.createElement(
@@ -3332,7 +3325,7 @@ function PluginPanelInner() {
         : null
     ),
     // -------- 修复汉化字体 --------
-    React.createElement(
+    activeTab === 'font' && React.createElement(
       PanelSection,
       { title: '修复汉化字体' },
       React.createElement(
