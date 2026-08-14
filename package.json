@@ -1,6 +1,6 @@
 {
   "name": "nonsteam-cleaner",
-  "version": "1.3.0",
+  "version": "1.4.5",
   "type": "module",
   "description": "清理非 Steam 游戏，并修复汉化字体显示为 ?? 的问题",
   "scripts": {
