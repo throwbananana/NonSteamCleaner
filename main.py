@@ -509,6 +509,210 @@ def is_steam_running() -> bool:
     return False
 
 
+def _find_steam_client_pid() -> int:
+    """定位 Steam 主客户端进程 pid（不是 steamwebhelper 子进程），用于强制重启。"""
+    for p in (
+        os.path.expanduser("~/.steampid"),
+        os.path.expanduser("~/.steam/steam.pid"),
+    ):
+        if not os.path.isfile(p):
+            continue
+        try:
+            pid = int(open(p, "r", encoding="utf-8", errors="replace").read().strip())
+        except Exception:  # noqa: BLE001
+            continue
+        if pid > 1 and os.path.exists(f"/proc/{pid}"):
+            return pid
+    try:
+        for pid_s in os.listdir("/proc"):
+            if not pid_s.isdigit():
+                continue
+            try:
+                comm = open(f"/proc/{pid_s}/comm", "r", encoding="utf-8", errors="replace").read().strip()
+            except Exception:  # noqa: BLE001
+                continue
+            if comm == "steam":
+                return int(pid_s)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def restart_steam_client() -> Dict[str, Any]:
+    """强制结束 Steam 客户端进程。
+
+    Steam 把 shortcuts.vdf/注册表等改动读进内存后不会自动感知外部修改；它自己退出
+    （包括整机重启时的正常关闭流程）时会把内存里那份旧数据重新写回磁盘，把插件刚
+    做的改动盖回去。普通"退出再打开"走的是 Steam 自己的优雅退出流程，一样会先把
+    旧数据存盘再关，所以改动一样保不住。这里改用 SIGKILL 跳过 Steam 自己的退出前
+    保存，Gaming Mode 下 gamescope 会话通常会自动把 Steam 重新拉起来；桌面模式下
+    杀掉后不一定会自动重开，需要用户自己手动启动一次 Steam。
+    """
+    pid = _find_steam_client_pid()
+    if not pid:
+        return {"success": False, "message": "未检测到正在运行的 Steam 客户端进程"}
+    try:
+        os.kill(pid, 9)
+    except ProcessLookupError:
+        return {"success": False, "message": "Steam 进程在重启前已经退出"}
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "message": f"重启失败: {e}"}
+    return {
+        "success": True,
+        "message": (
+            "已强制结束 Steam 客户端。Gaming Mode 下会自动重新拉起；"
+            "如果是桌面模式且没有自动重开，请手动启动 Steam。"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 备份文件管理
+#
+# 删除/去重/添加/改语言写 shortcuts.vdf 之前，以及修字体改 system.reg/user.reg
+# 之前，各处都会先备份成 <原文件>.bak_nsc* （具体后缀因功能而异，但都以
+# ".bak_nsc" 开头）。这些备份一直在磁盘上，只是从来没有清理、也没有入口拿来恢复。
+# 这里只覆盖"已知安全范围"——Steam userdata 的 shortcuts.vdf 和各 compatdata
+# 前缀的 system.reg/user.reg；游戏目录内的字体备份（Fonts/*.bak_nsc*）散落在
+# 用户自选的任意扫描目录里，没有可枚举的安全范围，不纳入这里。
+# ---------------------------------------------------------------------------
+_BAK_SUFFIX_RE = re.compile(r"\.bak_nsc\w*$")
+
+
+def _iter_known_backup_files() -> List[str]:
+    out: List[str] = []
+    root = find_steam_root()
+    if not root:
+        return out
+
+    ud_root = os.path.join(root, "userdata")
+    if os.path.isdir(ud_root):
+        for sid in os.listdir(ud_root):
+            cfg_dir = os.path.join(ud_root, sid, "config")
+            if not os.path.isdir(cfg_dir):
+                continue
+            try:
+                for fn in os.listdir(cfg_dir):
+                    if fn.startswith("shortcuts.vdf") and _BAK_SUFFIX_RE.search(fn):
+                        out.append(os.path.join(cfg_dir, fn))
+            except Exception:  # noqa: BLE001
+                continue
+
+    for lib_root in iter_steam_library_roots():
+        compat = os.path.join(lib_root, "steamapps", "compatdata")
+        if not os.path.isdir(compat):
+            continue
+        try:
+            appids = os.listdir(compat)
+        except Exception:  # noqa: BLE001
+            continue
+        for aid in appids:
+            pfx = os.path.join(compat, aid, "pfx")
+            if not os.path.isdir(pfx):
+                continue
+            try:
+                for fn in os.listdir(pfx):
+                    if fn.startswith(("system.reg", "user.reg")) and _BAK_SUFFIX_RE.search(fn):
+                        out.append(os.path.join(pfx, fn))
+            except Exception:  # noqa: BLE001
+                continue
+    return out
+
+
+def list_backup_files() -> List[Dict[str, Any]]:
+    """列出已知范围内的备份文件，最新的在前。"""
+    out: List[Dict[str, Any]] = []
+    for p in _iter_known_backup_files():
+        try:
+            st = os.stat(p)
+        except Exception:  # noqa: BLE001
+            continue
+        original = _BAK_SUFFIX_RE.sub("", p)
+        out.append(
+            {
+                "path": p,
+                "original": original,
+                "original_exists": os.path.isfile(original),
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+            }
+        )
+    out.sort(key=lambda x: -x["mtime"])
+    return out[:300]
+
+
+def restore_backup_file(path: str) -> Dict[str, Any]:
+    """把某个备份文件恢复回原路径。只接受已知安全范围内、命名匹配的备份。"""
+    p = _normalize(path) or str(path or "")
+    if not p or not os.path.isfile(p):
+        return {"success": False, "message": "备份文件不存在"}
+    if not _BAK_SUFFIX_RE.search(os.path.basename(p)):
+        return {"success": False, "message": "不是本插件产生的备份文件，拒绝操作"}
+    known = set(_iter_known_backup_files())
+    if p not in known:
+        return {"success": False, "message": "该备份不在已知安全范围内，拒绝操作"}
+
+    original = _BAK_SUFFIX_RE.sub("", p)
+    try:
+        if os.path.isfile(original):
+            import time as _time
+
+            shutil.copy2(
+                original,
+                original + f".bak_nsc_before_restore_{int(_time.time())}",
+            )
+        shutil.copy2(p, original)
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "message": f"恢复失败: {e}"}
+    return {
+        "success": True,
+        "original": original,
+        "message": f"已恢复 {os.path.basename(original)}。请完全退出 Steam 再打开以生效。",
+    }
+
+
+def cleanup_backup_files(keep_latest: int = 3, older_than_days: int = 14) -> Dict[str, Any]:
+    """清理旧备份：每个原始文件只保留最近 keep_latest 份，且只清理超过
+    older_than_days 天的（保证短期内出问题还能恢复，不会一清理就全没了）。
+    """
+    import time as _time
+
+    groups: Dict[str, List[str]] = {}
+    for p in _iter_known_backup_files():
+        original = _BAK_SUFFIX_RE.sub("", p)
+        groups.setdefault(original, []).append(p)
+
+    cutoff = _time.time() - max(0, older_than_days) * 86400
+    removed: List[str] = []
+    errors: List[str] = []
+    for _original, paths in groups.items():
+        stat_paths = []
+        for p in paths:
+            try:
+                stat_paths.append((os.stat(p).st_mtime, p))
+            except Exception:  # noqa: BLE001
+                continue
+        stat_paths.sort(key=lambda x: -x[0])
+        for i, (mtime, p) in enumerate(stat_paths):
+            if i < max(0, keep_latest):
+                continue
+            if mtime > cutoff:
+                continue
+            try:
+                os.remove(p)
+                removed.append(p)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{p}: {e}")
+
+    return {
+        "success": True,
+        "removed_count": len(removed),
+        "removed": removed[:50],
+        "errors": errors[:20],
+        "message": f"已清理 {len(removed)} 个旧备份" + (f"，{len(errors)} 个失败" if errors else ""),
+    }
+
+
 def list_all_nonsteam_games() -> List[Dict[str, Any]]:
     """解析所有用户 shortcuts.vdf，列出非 Steam 游戏。"""
     root = find_steam_root()
@@ -4951,3 +5155,37 @@ class Plugin:
         }
         logger.info("delete result %s", result)
         return result
+
+    async def restart_steam_client(self) -> Dict[str, Any]:
+        """强制结束 Steam 客户端进程，避免它退出时把内存里的旧 shortcuts/注册表
+        数据重新写回磁盘，盖掉插件刚做的改动。需要用户在前端明确点击确认。"""
+        return restart_steam_client()
+
+    async def list_backup_files(self) -> List[Dict[str, Any]]:
+        return list_backup_files()
+
+    async def restore_backup_file(self, path: str = "", **kwargs: Any) -> Dict[str, Any]:
+        if isinstance(path, dict):
+            kwargs = {**path, **kwargs}
+            path = kwargs.get("path", "")
+        return restore_backup_file(str(path or ""))
+
+    async def cleanup_backup_files(
+        self,
+        keep_latest: int = 3,
+        older_than_days: int = 14,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        if isinstance(keep_latest, dict):
+            kwargs = {**keep_latest, **kwargs}
+            keep_latest = kwargs.get("keep_latest", 3)
+            older_than_days = kwargs.get("older_than_days", older_than_days)
+        try:
+            keep_latest = int(keep_latest)
+        except Exception:  # noqa: BLE001
+            keep_latest = 3
+        try:
+            older_than_days = int(older_than_days)
+        except Exception:  # noqa: BLE001
+            older_than_days = 14
+        return cleanup_backup_files(keep_latest=keep_latest, older_than_days=older_than_days)

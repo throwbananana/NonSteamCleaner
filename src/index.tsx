@@ -65,6 +65,10 @@ const getPluginStatus = callable('get_plugin_status');
 const findDuplicateNonsteamGames = callable('find_duplicate_nonsteam_games');
 const purgeDuplicateShortcuts = callable('purge_duplicate_shortcuts');
 const fixGamePageTitles = callable('fix_game_page_titles');
+const restartSteamClient = callable('restart_steam_client');
+const listBackupFiles = callable('list_backup_files');
+const restoreBackupFile = callable('restore_backup_file');
+const cleanupBackupFiles = callable('cleanup_backup_files');
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -1637,6 +1641,11 @@ function PluginPanelInner() {
   const [dupGroups, setDupGroups] = React.useState<any[]>([]);
   const [dupStatus, setDupStatus] = React.useState('');
   const [dupBusy, setDupBusy] = React.useState(false);
+
+  const [restartBusy, setRestartBusy] = React.useState(false);
+  const [backupFiles, setBackupFiles] = React.useState<any[]>([]);
+  const [backupStatus, setBackupStatus] = React.useState('');
+  const [backupBusy, setBackupBusy] = React.useState(false);
 
   const refreshShotList = React.useCallback(async (appid?: number) => {
     setShotLoading(true);
@@ -3320,6 +3329,180 @@ function PluginPanelInner() {
                 },
               },
               '移除同启动器的重复快捷方式'
+            )
+          )
+        : null
+    ),
+    // -------- 维护工具（Steam 强制重启 / 备份管理） --------
+    activeTab === 'clean' && React.createElement(
+      PanelSection,
+      { title: '维护工具' },
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.4 } },
+          'Steam 运行时会把 shortcuts.vdf 缓存在内存里；删除/去重/改字体等操作改完磁盘文件后，' +
+            'Steam 自己退出（包括重启 Deck）时可能把内存里的旧数据写回去，看起来像是"改了又变回去"。' +
+            '遇到这种情况，用下面的按钮强制重启 Steam 客户端，跳过它退出前的自动保存。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: { ...btnStyle(), background: '#a33' },
+            disabled: restartBusy,
+            onClick: () => {
+              showConfirmModal({
+                title: '强制重启 Steam 客户端',
+                body:
+                  '会立即结束当前 Steam 进程（不是正常退出），游戏模式下通常会自动重新拉起；' +
+                  '桌面模式下如果没有自动重开，需要手动启动一次 Steam。当前 Steam 内未保存的状态会丢失。',
+                onConfirm: async () => {
+                  setRestartBusy(true);
+                  try {
+                    const r = unwrapResult(await restartSteamClient());
+                    toast('重启 Steam', r?.message || '完成');
+                  } catch (e) {
+                    toast('重启 Steam', String(e));
+                  } finally {
+                    setRestartBusy(false);
+                  }
+                },
+              });
+            },
+          },
+          restartBusy ? '重启中…' : '强制重启 Steam 客户端'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.4, marginTop: 4 } },
+          '删除/去重/改字体等操作之前都会自动备份原文件，下面可以查看并恢复。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: btnStyle(true),
+            disabled: backupBusy,
+            onClick: () => {
+              void (async () => {
+                setBackupBusy(true);
+                try {
+                  const list = (unwrapResult(await listBackupFiles()) || []) as any[];
+                  setBackupFiles(list);
+                  setBackupStatus(list.length ? `找到 ${list.length} 个备份` : '没有找到备份文件');
+                } catch (e) {
+                  setBackupStatus(String(e));
+                } finally {
+                  setBackupBusy(false);
+                }
+              })();
+            },
+          },
+          backupBusy ? '加载中…' : '查看备份文件'
+        )
+      ),
+      backupStatus
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement('div', { style: { fontSize: 12, color: '#9cf' } }, backupStatus)
+          )
+        : null,
+      ...backupFiles.slice(0, 20).map((b: any, i: number) =>
+        React.createElement(
+          PanelSectionRow,
+          { key: 'bak-' + i },
+          React.createElement(
+            'div',
+            { style: { fontSize: 12, lineHeight: 1.4, marginBottom: 4 } },
+            React.createElement(
+              'div',
+              { style: { opacity: 0.85, wordBreak: 'break-all' } },
+              String(b.original || '').split('/').pop() +
+                ' · ' +
+                new Date((b.mtime || 0) * 1000).toLocaleString() +
+                (b.original_exists ? '' : '（原文件已不存在）')
+            ),
+            React.createElement(
+              'button',
+              {
+                style: { ...btnStyle(), marginTop: 4 },
+                disabled: backupBusy,
+                onClick: () => {
+                  showConfirmModalSoft({
+                    title: '恢复备份',
+                    okText: '恢复',
+                    body:
+                      `把 ${String(b.original || '').split('/').pop()} 恢复成这份备份的内容？\n` +
+                      '恢复前会先把当前文件也备份一份。恢复后请完全退出 Steam 再打开。',
+                    onConfirm: async () => {
+                      setBackupBusy(true);
+                      try {
+                        const rr = unwrapResult(await restoreBackupFile({ path: b.path }));
+                        toast('恢复备份', rr?.message || '完成');
+                        const list = (unwrapResult(await listBackupFiles()) || []) as any[];
+                        setBackupFiles(list);
+                      } catch (e) {
+                        toast('恢复备份', String(e));
+                      } finally {
+                        setBackupBusy(false);
+                      }
+                    },
+                  });
+                },
+              },
+              '恢复这份备份'
+            )
+          )
+        )
+      ),
+      backupFiles.length
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement(
+              'button',
+              {
+                style: btnStyle(),
+                disabled: backupBusy,
+                onClick: () => {
+                  showConfirmModalSoft({
+                    title: '清理旧备份',
+                    okText: '清理',
+                    body: '每个文件只保留最近 3 份，且只清理 14 天以前的旧备份，近期的不会被删。',
+                    onConfirm: async () => {
+                      setBackupBusy(true);
+                      try {
+                        const rr = unwrapResult(
+                          await cleanupBackupFiles({ keep_latest: 3, older_than_days: 14 })
+                        );
+                        toast('清理备份', rr?.message || '完成');
+                        const list = (unwrapResult(await listBackupFiles()) || []) as any[];
+                        setBackupFiles(list);
+                        setBackupStatus(list.length ? `找到 ${list.length} 个备份` : '没有找到备份文件');
+                      } catch (e) {
+                        toast('清理备份', String(e));
+                      } finally {
+                        setBackupBusy(false);
+                      }
+                    },
+                  });
+                },
+              },
+              '清理旧备份（每份保留最近 3 个）'
             )
           )
         : null
