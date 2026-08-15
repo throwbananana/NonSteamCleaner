@@ -23,6 +23,7 @@ NonSteamCleaner - 彻底清理 Steam 中添加的非 Steam 游戏 (Decky Loader 
 import os
 import re
 import shutil
+import stat
 import struct
 import zlib
 import glob
@@ -1808,6 +1809,25 @@ _ARCHIVE_EXTS = (
     ".tar",
 )
 
+# 分卷压缩包：7z 原生分卷 (xxx.7z.001/.002/...)、RAR 新式分卷 (xxx.part1.rar/.part2.rar/...)。
+# 只有「第一卷」需要真正扔给解压工具处理（7z/unrar 会自动找同目录下的后续卷），
+# 其余卷单独按压缩包处理只会报错，属于噪音，直接忽略。
+_SPLIT_7Z_RE = re.compile(r"^(.+)\.7z\.(\d{3,})$", re.I)
+_SPLIT_RAR_PART_RE = re.compile(r"^(.+)\.part(\d+)\.rar$", re.I)
+
+
+def _archive_kind(name: str) -> str:
+    """返回 'entry'(应直接扔给解压工具)/'part'(分卷附属卷，忽略)/''(不是压缩包)。"""
+    m = _SPLIT_7Z_RE.match(name)
+    if m:
+        return "entry" if int(m.group(2)) == 1 else "part"
+    m = _SPLIT_RAR_PART_RE.match(name)
+    if m:
+        return "entry" if int(m.group(2)) == 1 else "part"
+    if _is_archive_file(name):
+        return "entry"
+    return ""
+
 
 def _is_archive_file(name: str) -> bool:
     lower = name.lower()
@@ -1815,6 +1835,12 @@ def _is_archive_file(name: str) -> bool:
 
 
 def _archive_stem(name: str) -> str:
+    m = _SPLIT_7Z_RE.match(name)
+    if m:
+        return m.group(1)
+    m = _SPLIT_RAR_PART_RE.match(name)
+    if m:
+        return m.group(1)
     lower = name.lower()
     for ext in _ARCHIVE_EXTS:
         if lower.endswith(ext):
@@ -1829,6 +1855,28 @@ def _dir_nonempty(path: str) -> bool:
         return any(os.scandir(path))
     except Exception:  # noqa: BLE001
         return False
+
+
+# Linux 原生启动项需要可执行位才能被 Steam 直接 exec()；.exe 是通过 Proton 读取运行的，
+# 不受此限制。压缩包（尤其是在 Windows 上打包的）通常不保留 unix 可执行位，
+# 纯 Python zipfile 解压更是完全不还原权限位，导致解压出来的启动器加进 Steam 后无法启动。
+_LINUX_LAUNCHER_EXTS = (".sh", ".x86_64", ".x86", ".appimage")
+
+
+def _ensure_executable(path: str) -> None:
+    """确保 Linux 原生启动项带有可执行位；静默失败（只读文件系统等）不影响扫描。"""
+    try:
+        st = os.stat(path)
+        mode = st.st_mode
+        want = mode | stat.S_IXUSR
+        if mode & stat.S_IRGRP:
+            want |= stat.S_IXGRP
+        if mode & stat.S_IROTH:
+            want |= stat.S_IXOTH
+        if want != mode:
+            os.chmod(path, want)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _clean_subprocess_env() -> dict:
@@ -1897,19 +1945,44 @@ def _safe_tar_extract(archive_path: str, dest_dir: str) -> None:
         tf.extractall(dest_dir, members=safe)
 
 
+# 解压成功后在 dest_dir 内写入的标记文件名。仅凭目录是否非空判断"已解压"会把
+# 半途失败（磁盘满/加密包/损坏包）留下的残余文件误当成功，此后每次扫描都静默跳过、
+# 永远不会重试；改用显式标记后，只有真正解压成功过的目录才会被跳过。
+_EXTRACT_OK_MARKER = ".nsc_extract_ok"
+
+
+def _mark_extracted_ok(dest_dir: str) -> None:
+    try:
+        with open(os.path.join(dest_dir, _EXTRACT_OK_MARKER), "w", encoding="utf-8") as fp:
+            fp.write("1")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _already_extracted(dest_dir: str) -> bool:
+    if os.path.isfile(os.path.join(dest_dir, _EXTRACT_OK_MARKER)):
+        return True
+    # 兼容旧版本遗留的解压结果（当时没有标记文件）：非空即视为已完成，
+    # 并补写标记，避免下次仍要靠这条兼容路径判断。
+    if _dir_nonempty(dest_dir):
+        _mark_extracted_ok(dest_dir)
+        return True
+    return False
+
+
 def _extract_one_archive(archive_path: str, dest_dir: str) -> Dict[str, Any]:
-    """解压单个压缩包到 dest_dir。优先 7z（兼容 zip/7z/rar/tar.*）。"""
+    """解压单个压缩包到 dest_dir。优先 7z（兼容 zip/7z/rar/tar.*，含分卷）。"""
     os.makedirs(dest_dir, exist_ok=True)
     lower = archive_path.lower()
-    # 已解压过则跳过
-    if _dir_nonempty(dest_dir):
+    if _already_extracted(dest_dir):
         return {"ok": True, "skipped": True, "dest": dest_dir, "message": "目标已存在，跳过"}
 
-    # 1) 7z / 7za — 最通用
+    # 1) 7z / 7za — 最通用，原生支持 7z/rar 分卷（给第一卷即可自动关联后续卷）
     for bin7 in ("7z", "7za"):
         if shutil.which(bin7):
             code, err = _run_cmd([bin7, "x", "-y", f"-o{dest_dir}", archive_path])
             if code == 0:
+                _mark_extracted_ok(dest_dir)
                 return {"ok": True, "skipped": False, "dest": dest_dir, "tool": bin7}
             logger.warning("7z extract fail %s: %s", archive_path, err)
 
@@ -1918,17 +1991,20 @@ def _extract_one_archive(archive_path: str, dest_dir: str) -> Dict[str, Any]:
         if shutil.which("unzip"):
             code, err = _run_cmd(["unzip", "-o", "-q", archive_path, "-d", dest_dir])
             if code == 0:
+                _mark_extracted_ok(dest_dir)
                 return {"ok": True, "skipped": False, "dest": dest_dir, "tool": "unzip"}
         try:
             _safe_zip_extract(archive_path, dest_dir)
+            _mark_extracted_ok(dest_dir)
             return {"ok": True, "skipped": False, "dest": dest_dir, "tool": "zipfile"}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "dest": dest_dir, "message": f"zip 解压失败: {e}"}
 
-    # 3) rar → unrar
+    # 3) rar（含 .partN.rar 分卷第一卷）→ unrar
     if lower.endswith(".rar") and shutil.which("unrar"):
         code, err = _run_cmd(["unrar", "x", "-o+", archive_path, dest_dir + "/"])
         if code == 0:
+            _mark_extracted_ok(dest_dir)
             return {"ok": True, "skipped": False, "dest": dest_dir, "tool": "unrar"}
         return {"ok": False, "dest": dest_dir, "message": err}
 
@@ -1937,9 +2013,11 @@ def _extract_one_archive(archive_path: str, dest_dir: str) -> Dict[str, Any]:
         if shutil.which("tar"):
             code, err = _run_cmd(["tar", "-xf", archive_path, "-C", dest_dir])
             if code == 0:
+                _mark_extracted_ok(dest_dir)
                 return {"ok": True, "skipped": False, "dest": dest_dir, "tool": "tar"}
         try:
             _safe_tar_extract(archive_path, dest_dir)
+            _mark_extracted_ok(dest_dir)
             return {"ok": True, "skipped": False, "dest": dest_dir, "tool": "tarfile"}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "dest": dest_dir, "message": f"tar 解压失败: {e}"}
@@ -1968,7 +2046,10 @@ def extract_archives_in_tree(
                 continue
             dirnames[:] = [d for d in dirnames if not _is_skipped_dir(d)]
             for fn in filenames:
-                if _is_archive_file(fn):
+                # 分卷压缩包（xxx.7z.002、xxx.part2.rar...）不单独处理，
+                # 只处理第一卷，交给解压工具自动关联后续卷；否则每个附属卷
+                # 都会被当成独立压缩包尝试解压、报一堆无意义的"失败"。
+                if _archive_kind(fn) == "entry":
                     archives.append(os.path.join(dirpath, fn))
 
         if not archives:
@@ -1979,11 +2060,13 @@ def extract_archives_in_tree(
             stem = _archive_stem(os.path.basename(ap))
             # 解压到同目录下的「去掉扩展名」文件夹
             dest = os.path.join(os.path.dirname(ap), stem)
-            # 避免解压到自身内部造成循环：若 dest 就是某种奇怪路径则跳过
-            if os.path.commonpath([os.path.realpath(ap), os.path.realpath(dest + os.sep)]) == os.path.realpath(ap):
+            # 避免压缩包自身已经位于目标目录内部（例如经过软链接绕回）导致解压死循环
+            ap_rp = os.path.realpath(ap)
+            dest_rp = os.path.realpath(dest)
+            if ap_rp == dest_rp or os.path.commonpath([ap_rp, dest_rp]) == dest_rp:
                 continue
-            # 标记：同目录已有同名文件夹且非空 → 视为已解压
-            if _dir_nonempty(dest):
+            # 已经成功解压过（标记文件存在，或兼容旧版本的非空目录）→ 跳过
+            if _already_extracted(dest):
                 skipped += 1
                 continue
             # 体积保护：> 40GB 跳过
@@ -3685,6 +3768,8 @@ def scan_folder_for_games(
                 continue
             if lower.endswith(".sh") and sz > 2 * 1024 * 1024:
                 continue
+            if lower.endswith(_LINUX_LAUNCHER_EXTS):
+                _ensure_executable(full)
             exe_n = os.path.realpath(full)
             start = os.path.dirname(exe_n) + os.sep
             name = _guess_game_name(exe_n, scan_path)
