@@ -10,11 +10,13 @@ NonSteamCleaner - 彻底清理 Steam 中添加的非 Steam 游戏 (Decky Loader 
         3) 本体 + 存档 + 着色器缓存
         4) 本体 + 着色器缓存
   - 同时清理 Steam 库中的快捷方式(shortcuts.vdf)以及对应的网格图片
+  - 回收站：删除先移入所在分区的回收站，可列出/还原/彻底删除，过期自动清理
   - 扫描添加、失效/重复快捷方式、截图设图标
   - 修复汉化字体：为非 Steam 游戏设置中/日/繁 Proton 区域、黑体映射与 LANG 启动项
 
 注意:
-  - 删除操作不可恢复，前端会有二次确认。
+  - 默认开启回收站：删除是"移进同分区回收站"，可还原；关掉后才是真删除。
+    前端始终会有二次确认。
   - 修改 shortcuts.vdf 后需要重启 Steam 才能在库中消失。
   - "本体"会删除可执行文件及其 StartDir 所在的游戏目录。
   - "存档"通过删除 compatdata/<appid> 前缀实现，这同时会删除 Proton 前缀(注册表/配置)。
@@ -966,6 +968,487 @@ def _collect_grid_files(userdata_id: str, appid: Any) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# 回收站（软删除）
+#
+# 删除游戏本体动辄几十 GB，跨分区复制既慢又要求目标分区有同样多的空闲空间，
+# 所以回收站不是一个固定目录，而是"每个分区一个"：目标文件在哪个挂载点上，
+# 就丢进那个挂载点的回收站，这样 os.rename 是同设备内的元数据操作，秒完成、
+# 不额外占空间。目录名以点开头，`_should_skip_dir`（`n.startswith(".")`）会
+# 自动把它排除在扫描之外，回收站里的 exe 不会被重新扫出来加回库里。
+# ---------------------------------------------------------------------------
+_TRASH_DIR_NAME = ".nonsteamcleaner-trash"
+_TRASH_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+_TRASH_KIND_LABELS = {
+    "body": "本体",
+    "saves": "存档/前缀",
+    "shader": "着色器缓存",
+    "grid": "网格图",
+}
+
+
+def _home_trash_root() -> str:
+    return os.path.expanduser("~/.local/share/NonSteamCleaner/trash")
+
+
+def _mount_point_for(path: str) -> str:
+    """返回 path 所在的挂载点。path 不存在时向上找到第一个存在的父目录。"""
+    try:
+        p = os.path.realpath(path)
+    except Exception:  # noqa: BLE001
+        return "/"
+    while p and p != "/" and not os.path.exists(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    while p and p != "/":
+        try:
+            if os.path.ismount(p):
+                return p
+        except Exception:  # noqa: BLE001
+            break
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return "/"
+
+
+def _trash_root_for(path: str) -> str:
+    """给定待删除路径，返回同一分区上的回收站根目录。"""
+    mp = _mount_point_for(path)
+    if mp == _mount_point_for(os.path.expanduser("~")):
+        return _home_trash_root()
+    return os.path.join(mp, _TRASH_DIR_NAME)
+
+
+_TRASH_PSEUDO_FS = {
+    "proc", "sysfs", "devtmpfs", "devpts", "cgroup", "cgroup2", "securityfs",
+    "pstore", "bpf", "debugfs", "tracefs", "configfs", "fusectl", "mqueue",
+    "hugetlbfs", "autofs", "binfmt_misc", "efivarfs", "ramfs", "nsfs",
+    "squashfs", "overlay",
+}
+
+
+def _iter_mount_points() -> List[str]:
+    """读 /proc/self/mounts 拿到真实挂载点，跳过内核伪文件系统。
+
+    不能只看 home / Steam 库 / /run/media：游戏可能挂在 /mnt/games 之类的地方，
+    漏掉那个挂载点会让丢进去的回收站条目再也列不出来，白占磁盘。
+    """
+    out: List[str] = []
+    seen = set()
+    try:
+        with open("/proc/self/mounts", "r", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mp, fstype = parts[1], parts[2]
+                if fstype in _TRASH_PSEUDO_FS:
+                    continue
+                # /proc/mounts 里的路径是八进制转义的
+                mp = mp.replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\")
+                if mp not in seen and os.path.isdir(mp):
+                    seen.add(mp)
+                    out.append(mp)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("读取挂载点失败: %s", e)
+    return out
+
+
+def _iter_trash_roots() -> List[str]:
+    """列出所有可能存在回收站的位置：home + 各 Steam 库分区 + 所有真实挂载点。"""
+    roots: List[str] = [_home_trash_root()]
+    seen = {os.path.realpath(roots[0])}
+
+    def _add(p: str) -> None:
+        try:
+            rp = os.path.realpath(p)
+        except Exception:  # noqa: BLE001
+            return
+        if rp not in seen:
+            seen.add(rp)
+            roots.append(p)
+
+    for lib_root in iter_steam_library_roots():
+        _add(_trash_root_for(lib_root))
+    for mp in _iter_mount_points():
+        _add(os.path.join(mp, _TRASH_DIR_NAME))
+    return roots
+
+
+def _dir_size(path: str, max_entries: int = 300000) -> int:
+    """统计目录占用。只读元数据，但对超大目录设上限避免卡住删除流程。"""
+    total = 0
+    count = 0
+    stack = [path]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    count += 1
+                    if count > max_entries:
+                        return total
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except Exception:  # noqa: BLE001
+                        continue
+        except Exception:  # noqa: BLE001
+            continue
+    return total
+
+
+def _path_size(path: str) -> int:
+    try:
+        if os.path.islink(path):
+            return 0
+        if os.path.isdir(path):
+            return _dir_size(path)
+        return os.path.getsize(path)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _new_trash_id() -> str:
+    import time as _time
+    import uuid as _uuid
+
+    return _time.strftime("%Y%m%d-%H%M%S") + "-" + _uuid.uuid4().hex[:6]
+
+
+def _is_inside_trash(path: str) -> bool:
+    try:
+        rp = os.path.realpath(path)
+    except Exception:  # noqa: BLE001
+        return False
+    parts = rp.split("/")
+    if _TRASH_DIR_NAME in parts:
+        return True
+    home_trash = os.path.realpath(_home_trash_root())
+    return rp == home_trash or rp.startswith(home_trash + "/")
+
+
+def move_to_trash(path: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """把 path 移进同分区回收站，返回 {'success', 'id', 'trash_root', 'message'}。
+
+    移动成功后原路径就不存在了，效果等同删除，但文件还在，可以还原。
+    """
+    import json
+    import time as _time
+
+    if not path or not os.path.lexists(path):
+        return {"success": False, "message": "路径不存在"}
+    if not _safe_to_delete(path):
+        return {"success": False, "message": "路径受保护，拒绝操作"}
+    if _is_inside_trash(path):
+        return {"success": False, "message": "该路径已在回收站内"}
+
+    root = _trash_root_for(path)
+    tid = _new_trash_id()
+    entry = os.path.join(root, tid)
+    payload = os.path.join(entry, "payload")
+    name = os.path.basename(path.rstrip("/")) or "item"
+
+    size = _path_size(path)
+    is_dir = os.path.isdir(path) and not os.path.islink(path)
+
+    try:
+        os.makedirs(payload, exist_ok=True)
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "message": f"无法创建回收站目录: {e}"}
+
+    dest = os.path.join(payload, name)
+    moved = False
+    try:
+        os.rename(path, dest)
+        moved = True
+    except OSError:
+        # 跨设备（回收站落在别的分区）等情况：退回复制+删除
+        try:
+            shutil.move(path, dest)
+            moved = True
+        except Exception as e:  # noqa: BLE001
+            logger.error("移入回收站失败 %s: %s", path, e)
+            shutil.rmtree(entry, ignore_errors=True)
+            return {"success": False, "message": f"移入回收站失败: {e}"}
+    except Exception as e:  # noqa: BLE001
+        shutil.rmtree(entry, ignore_errors=True)
+        return {"success": False, "message": f"移入回收站失败: {e}"}
+
+    if not moved:
+        shutil.rmtree(entry, ignore_errors=True)
+        return {"success": False, "message": "移入回收站失败"}
+
+    info: Dict[str, Any] = {
+        "version": 1,
+        "id": tid,
+        "original": path,
+        "name": name,
+        "is_dir": is_dir,
+        "size": size,
+        "deleted_at": int(_time.time()),
+    }
+    for k in ("game_name", "appid", "userdata_id", "kind", "group"):
+        if meta and meta.get(k) is not None:
+            info[k] = meta.get(k)
+    try:
+        with open(os.path.join(entry, "meta.json"), "w", encoding="utf-8") as fp:
+            json.dump(info, fp, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        # 元数据写不进去不影响文件已被移走，只是还原时缺信息
+        logger.warning("写回收站元数据失败 %s: %s", entry, e)
+
+    return {"success": True, "id": tid, "trash_root": root, "entry": entry, "size": size}
+
+
+def _read_trash_entry(entry: str) -> Optional[Dict[str, Any]]:
+    import json
+
+    tid = os.path.basename(entry.rstrip("/"))
+    if not _TRASH_ID_RE.match(tid):
+        return None
+    payload = os.path.join(entry, "payload")
+    if not os.path.isdir(payload):
+        return None
+    try:
+        names = os.listdir(payload)
+    except Exception:  # noqa: BLE001
+        return None
+    if not names:
+        return None
+    item_path = os.path.join(payload, names[0])
+
+    info: Dict[str, Any] = {}
+    meta_file = os.path.join(entry, "meta.json")
+    if os.path.isfile(meta_file):
+        try:
+            data = json.load(open(meta_file, "r", encoding="utf-8"))
+            if isinstance(data, dict):
+                info = data
+        except Exception:  # noqa: BLE001
+            info = {}
+
+    try:
+        mtime = int(os.stat(entry).st_mtime)
+    except Exception:  # noqa: BLE001
+        mtime = 0
+
+    out = {
+        "id": tid,
+        "entry": entry,
+        "path": item_path,
+        "name": info.get("name") or names[0],
+        "original": info.get("original") or "",
+        "original_exists": bool(info.get("original")) and os.path.lexists(str(info.get("original"))),
+        "is_dir": bool(info.get("is_dir", os.path.isdir(item_path))),
+        "size": int(info.get("size") or 0),
+        "deleted_at": int(info.get("deleted_at") or mtime),
+        "game_name": info.get("game_name") or "",
+        "appid": info.get("appid") or 0,
+        "kind": info.get("kind") or "",
+        "kind_label": _TRASH_KIND_LABELS.get(str(info.get("kind") or ""), ""),
+        "group": info.get("group") or "",
+        "has_meta": bool(info),
+    }
+    if not out["size"]:
+        out["size"] = _path_size(item_path)
+    return out
+
+
+def list_trash_items(limit: int = 300) -> List[Dict[str, Any]]:
+    """列出所有分区回收站里的条目，最新的在前。"""
+    items: List[Dict[str, Any]] = []
+    for root in _iter_trash_roots():
+        if not os.path.isdir(root):
+            continue
+        try:
+            names = os.listdir(root)
+        except Exception:  # noqa: BLE001
+            continue
+        for n in names:
+            entry = os.path.join(root, n)
+            if not os.path.isdir(entry):
+                continue
+            info = _read_trash_entry(entry)
+            if info:
+                items.append(info)
+    items.sort(key=lambda x: -int(x.get("deleted_at") or 0))
+    return items[: max(1, limit)]
+
+
+def _find_trash_entry(item_id: str) -> Optional[Dict[str, Any]]:
+    tid = str(item_id or "").strip()
+    if not _TRASH_ID_RE.match(tid):
+        return None
+    for root in _iter_trash_roots():
+        entry = os.path.join(root, tid)
+        if os.path.isdir(entry):
+            return _read_trash_entry(entry)
+    return None
+
+
+def restore_trash_item(item_id: str, overwrite: bool = False) -> Dict[str, Any]:
+    """把回收站条目移回原路径。原路径已存在时默认拒绝，避免盖掉新内容。"""
+    info = _find_trash_entry(item_id)
+    if not info:
+        return {"success": False, "message": "回收站中没有这个条目"}
+    original = str(info.get("original") or "")
+    if not original:
+        return {
+            "success": False,
+            "message": "这个条目缺少原路径信息（元数据丢失），无法自动还原",
+        }
+    src = info["path"]
+    if not os.path.lexists(src):
+        return {"success": False, "message": "回收站里的文件已不存在"}
+
+    if os.path.lexists(original):
+        if not overwrite:
+            return {
+                "success": False,
+                "message": f"原路径已存在同名文件/目录，未覆盖：{original}",
+            }
+        import time as _time
+
+        aside = f"{original}.replaced_by_restore_{int(_time.time())}"
+        try:
+            os.rename(original, aside)
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "message": f"无法移开原路径上已有的内容: {e}"}
+
+    parent = os.path.dirname(original)
+    try:
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "message": f"无法创建目标目录: {e}"}
+
+    try:
+        os.rename(src, original)
+    except OSError:
+        try:
+            shutil.move(src, original)
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "message": f"还原失败: {e}"}
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "message": f"还原失败: {e}"}
+
+    shutil.rmtree(info["entry"], ignore_errors=True)
+    return {
+        "success": True,
+        "original": original,
+        "message": (
+            f"已还原到 {original}。文件回来了，但库里的快捷方式不会自动加回来，"
+            "需要用「扫描添加」重新加入 Steam。"
+        ),
+    }
+
+
+def purge_trash_items(
+    ids: Optional[List[str]] = None,
+    older_than_days: Optional[int] = None,
+    purge_all: bool = False,
+) -> Dict[str, Any]:
+    """真正删除回收站条目。ids / older_than_days / purge_all 三选一。"""
+    import time as _time
+
+    targets: List[Dict[str, Any]] = []
+    if ids:
+        for i in ids:
+            info = _find_trash_entry(str(i))
+            if info:
+                targets.append(info)
+    else:
+        items = list_trash_items(limit=100000)
+        if purge_all:
+            targets = items
+        elif older_than_days is not None:
+            cutoff = _time.time() - max(0, int(older_than_days)) * 86400
+            targets = [x for x in items if int(x.get("deleted_at") or 0) < cutoff]
+
+    removed = 0
+    freed = 0
+    errors: List[str] = []
+    for info in targets:
+        entry = info["entry"]
+        # 双保险：只删回收站根目录下、ID 命名合规的目录
+        if not _TRASH_ID_RE.match(os.path.basename(entry.rstrip("/"))):
+            continue
+        if not _is_inside_trash(entry):
+            continue
+        try:
+            shutil.rmtree(entry)
+            removed += 1
+            freed += int(info.get("size") or 0)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{entry}: {e}")
+
+    return {
+        "success": True,
+        "removed_count": removed,
+        "freed": freed,
+        "errors": errors[:20],
+        "message": f"已彻底删除 {removed} 项，释放约 {_human_size(freed)}"
+        + (f"，{len(errors)} 项失败" if errors else ""),
+    }
+
+
+def trash_usage() -> Dict[str, Any]:
+    items = list_trash_items(limit=100000)
+    total = sum(int(x.get("size") or 0) for x in items)
+    return {
+        "success": True,
+        "count": len(items),
+        "size": total,
+        "size_human": _human_size(total),
+        "roots": [r for r in _iter_trash_roots() if os.path.isdir(r)],
+    }
+
+
+def _human_size(n: Any) -> str:
+    try:
+        v = float(n or 0)
+    except Exception:  # noqa: BLE001
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if v < 1024 or unit == "TB":
+            return (f"{v:.0f} {unit}" if unit == "B" else f"{v:.1f} {unit}")
+        v /= 1024
+    return f"{v:.1f} TB"
+
+
+def dispose_path(path: str, use_trash: bool, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """按设置删除一个路径：开了回收站就移进回收站，否则直接删。
+
+    回收站失败时不静默降级成硬删除——用户开着回收站却被真删了是最糟的结果，
+    宁可报错让这一项留在原地。
+    """
+    if use_trash:
+        r = move_to_trash(path, meta)
+        if r.get("success"):
+            return {"ok": True, "mode": "trash", "id": r.get("id"), "size": r.get("size", 0)}
+        return {"ok": False, "mode": "trash", "error": r.get("message") or "移入回收站失败"}
+
+    try:
+        if os.path.islink(path) or os.path.isfile(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            return {"ok": False, "mode": "delete", "error": "路径类型无法识别"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "mode": "delete", "error": str(e)}
+    return {"ok": True, "mode": "delete"}
+
+
+# ---------------------------------------------------------------------------
 # 扫描 / 添加非 Steam 游戏
 # ---------------------------------------------------------------------------
 _DEFAULT_SCAN_PATH = os.path.expanduser("~/Downloads")
@@ -1038,6 +1521,8 @@ def load_settings() -> Dict[str, Any]:
         "hidden_exes": [],  # 隐藏的启动项（归一化绝对路径）
         # 截图设为图标时的输出最长边（像素）；0=原图不缩放
         "screenshot_max_edge": 768,
+        "trash_enabled": True,  # 删除时先移入回收站，而不是直接删掉
+        "trash_keep_days": 14,  # 回收站里超过这么多天的条目会被自动清掉
     }
     path = _settings_path()
     try:
@@ -1072,6 +1557,11 @@ def load_settings() -> Dict[str, Any]:
         defaults["screenshot_max_edge"] = sme
     except Exception:  # noqa: BLE001
         defaults["screenshot_max_edge"] = 768
+    defaults["trash_enabled"] = bool(defaults.get("trash_enabled", True))
+    try:
+        defaults["trash_keep_days"] = max(0, min(365, int(defaults.get("trash_keep_days", 14))))
+    except Exception:  # noqa: BLE001
+        defaults["trash_keep_days"] = 14
     hidden = defaults.get("hidden_exes") or []
     if not isinstance(hidden, list):
         hidden = []
@@ -1120,6 +1610,13 @@ def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
                     seen.add(n)
                     cleaned.append(n)
             cur["hidden_exes"] = cleaned
+    if "trash_enabled" in settings:
+        cur["trash_enabled"] = bool(settings.get("trash_enabled"))
+    if "trash_keep_days" in settings:
+        try:
+            cur["trash_keep_days"] = max(0, min(365, int(settings["trash_keep_days"])))
+        except Exception:  # noqa: BLE001
+            pass
     if "screenshot_max_edge" in settings:
         try:
             sme = int(settings.get("screenshot_max_edge") or 0)
@@ -4229,6 +4726,15 @@ def add_games_to_steam(
 class Plugin:
     async def _main(self):
         logger.info("NonSteamCleaner started")
+        # 顺手清掉过期的回收站条目，避免它无声无息把磁盘吃满
+        try:
+            keep = int(load_settings().get("trash_keep_days", 14))
+            if keep > 0:
+                r = purge_trash_items(older_than_days=keep)
+                if r.get("removed_count"):
+                    logger.info("回收站自动清理: %s", r.get("message"))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("回收站自动清理失败: %s", e)
 
     async def _unload(self):
         logger.info("NonSteamCleaner unloaded")
@@ -4930,7 +5436,20 @@ class Plugin:
         delete_saves: bool,
         delete_shader: bool,
     ) -> List[str]:
-        targets: List[str] = []
+        return [p for p, _kind in self._compute_targets_detailed(
+            game, delete_body, delete_saves, delete_shader
+        )]
+
+    def _compute_targets_detailed(
+        self,
+        game: Dict[str, Any],
+        delete_body: bool,
+        delete_saves: bool,
+        delete_shader: bool,
+    ) -> List[tuple]:
+        """同 _compute_targets，但每项附带类别（body/saves/shader/grid），
+        用于写进回收站元数据，让还原界面能说清这是本体还是存档。"""
+        targets: List[tuple] = []
         appid = normalize_appid(game.get("appid"))
         sid = str(game.get("userdata_id") or "")
 
@@ -4954,7 +5473,7 @@ class Plugin:
             container = start_base in _TROUBLE_CONTAINERS or start_base in ("downloads", "games")
             # StartDir：仅当它足够“像游戏目录”且不被其它快捷方式共用时才整目录删除
             if start and os.path.isdir(start) and _safe_to_delete(start) and not shared and not container:
-                targets.append(start)
+                targets.append((start, "body"))
             elif shared:
                 logger.warning(
                     "start dir shared with %s, will not rmtree: %s",
@@ -4963,44 +5482,45 @@ class Plugin:
                 )
             # 可执行文件：始终尝试（若已在 start 目录内则不必重复）
             if exe and os.path.exists(exe) and _safe_to_delete(exe):
+                paths = [p for p, _k in targets]
                 if not start or not exe.startswith(start.rstrip("/") + "/"):
-                    if exe not in targets:
-                        targets.append(exe)
-                elif start not in targets:
+                    if exe not in paths:
+                        targets.append((exe, "body"))
+                elif start not in paths:
                     # start 未加入（不安全或共用）时至少删 exe
-                    targets.append(exe)
+                    targets.append((exe, "body"))
             elif exe:
                 logger.warning("exe 不存在或不可删: %s", exe)
 
         if delete_saves:
             for cd in _collect_prefix_dirs(appid, "compatdata"):
                 if _safe_to_delete(cd):
-                    targets.append(cd)
+                    targets.append((cd, "saves"))
 
         if delete_shader:
             for sc in _collect_prefix_dirs(appid, "shadercache"):
                 if _safe_to_delete(sc):
-                    targets.append(sc)
+                    targets.append((sc, "shader"))
 
         # 网格图：移除快捷方式时一并清
         for f in _collect_grid_files(sid, appid):
             if os.path.exists(f) and _safe_to_delete(f):
-                targets.append(f)
+                targets.append((f, "grid"))
 
         # 去重
         seen = set()
-        out: List[str] = []
-        for t in targets:
+        out: List[tuple] = []
+        for t, kind in targets:
             rt = os.path.realpath(t) if os.path.exists(t) else t
             if rt not in seen:
                 seen.add(rt)
-                out.append(t)
+                out.append((t, kind))
         logger.info(
             "targets body=%s saves=%s shader=%s -> %s",
             delete_body,
             delete_saves,
             delete_shader,
-            out,
+            [p for p, _k in out],
         )
         return out
 
@@ -5043,6 +5563,7 @@ class Plugin:
             running.get("running")
             and normalize_appid(running.get("appid")) == game["appid"]
         )
+        use_trash = bool(load_settings().get("trash_enabled", True))
         warnings: List[str] = []
         if is_steam_running():
             warnings.append("Steam 正在运行：写入 shortcuts 后请完全退出再打开，否则库列表可能被缓存盖回。")
@@ -5051,6 +5572,7 @@ class Plugin:
         if shared:
             names = "、".join(str(s.get("name") or s.get("appid")) for s in shared[:4])
             warnings.append(f"启动目录与其它快捷方式共用（{names}），将只删本游戏 exe，不删整个目录。")
+        total = sum(_path_size(t) for t in existing)
         return {
             "targets": targets,
             "existing": existing,
@@ -5061,6 +5583,9 @@ class Plugin:
             "game_running": game_running,
             "shared_startdir": [s.get("name") for s in shared],
             "warnings": warnings,
+            "trash_enabled": use_trash,
+            "total_size": total,
+            "total_size_human": _human_size(total),
         }
 
     async def delete_non_steam_game(
@@ -5106,23 +5631,38 @@ class Plugin:
             exe,
             start_dir,
         )
-        targets = self._compute_targets(game, delete_body, delete_saves, delete_shader)
+        detailed = self._compute_targets_detailed(game, delete_body, delete_saves, delete_shader)
+        targets = [p for p, _k in detailed]
+
+        settings = load_settings()
+        use_trash = bool(settings.get("trash_enabled", True))
+        group_id = _new_trash_id()
+        game_name = str(kwargs.get("name") or game.get("name") or "")
 
         deleted: List[str] = []
+        trashed: List[str] = []
         failed: List[str] = []
-        for t in targets:
-            try:
-                if not os.path.lexists(t):
-                    continue
-                if os.path.islink(t) or os.path.isfile(t):
-                    os.unlink(t)
-                    deleted.append(t)
-                elif os.path.isdir(t):
-                    shutil.rmtree(t)
-                    deleted.append(t)
-            except Exception as e:  # noqa: BLE001
-                logger.error("删除失败 %s: %s", t, e)
-                failed.append(f"{t}: {e}")
+        for t, kind in detailed:
+            if not os.path.lexists(t):
+                continue
+            r = dispose_path(
+                t,
+                use_trash,
+                {
+                    "game_name": game_name,
+                    "appid": game["appid"],
+                    "userdata_id": game["userdata_id"],
+                    "kind": kind,
+                    "group": group_id,
+                },
+            )
+            if r.get("ok"):
+                deleted.append(t)
+                if r.get("mode") == "trash":
+                    trashed.append(t)
+            else:
+                logger.error("删除失败 %s: %s", t, r.get("error"))
+                failed.append(f"{t}: {r.get('error')}")
 
         # 从所有用户 shortcuts.vdf 移除（key/appid/exe 多重匹配 + 重排 + 校验）
         rm = remove_shortcuts_from_steam(
@@ -5139,19 +5679,26 @@ class Plugin:
         else:
             logger.info("shortcut remove ok: %s", rm)
 
+        hint = (
+            "若库中仍显示，请完全退出 Steam 再打开（Steam 运行中可能用内存缓存覆盖 shortcuts）。"
+            if removed_shortcut
+            else "未能改写 shortcuts.vdf，请完全退出 Steam 后重试清理。"
+        )
+        if trashed:
+            hint = f"文件已移入回收站，删错了可在「维护工具 → 回收站」还原。{hint}"
+
         result = {
             "deleted": deleted,
+            "trashed": trashed,
+            "trash_enabled": use_trash,
+            "trash_group": group_id if trashed else "",
             "failed": failed,
             "removed_shortcut": removed_shortcut,
             "removed_shortcut_count": rm.get("removed_count", 0),
             "shortcut_details": rm.get("details") or [],
             "targets": targets,
             "count": len(deleted),
-            "hint": (
-                "若库中仍显示，请完全退出 Steam 再打开（Steam 运行中可能用内存缓存覆盖 shortcuts）。"
-                if removed_shortcut
-                else "未能改写 shortcuts.vdf，请完全退出 Steam 后重试清理。"
-            ),
+            "hint": hint,
         }
         logger.info("delete result %s", result)
         return result
@@ -5160,6 +5707,60 @@ class Plugin:
         """强制结束 Steam 客户端进程，避免它退出时把内存里的旧 shortcuts/注册表
         数据重新写回磁盘，盖掉插件刚做的改动。需要用户在前端明确点击确认。"""
         return restart_steam_client()
+
+    # ---- 回收站 ----
+    async def list_trash_items(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        items = list_trash_items()
+        total = sum(int(x.get("size") or 0) for x in items)
+        for it in items:
+            it["size_human"] = _human_size(it.get("size"))
+        return {
+            "success": True,
+            "items": items,
+            "count": len(items),
+            "size": total,
+            "size_human": _human_size(total),
+        }
+
+    async def get_trash_usage(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        return trash_usage()
+
+    async def restore_trash_item(
+        self, item_id: Any = "", overwrite: bool = False, **kwargs: Any
+    ) -> Dict[str, Any]:
+        if isinstance(item_id, dict):
+            kwargs = {**item_id, **kwargs}
+            item_id = kwargs.get("item_id", "")
+        if kwargs:
+            item_id = kwargs.get("item_id", item_id)
+            overwrite = kwargs.get("overwrite", overwrite)
+        return restore_trash_item(str(item_id or ""), bool(overwrite))
+
+    async def purge_trash_items(
+        self,
+        ids: Any = None,
+        older_than_days: Any = None,
+        purge_all: bool = False,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        if isinstance(ids, dict):
+            kwargs = {**ids, **kwargs}
+            ids = kwargs.get("ids")
+        if kwargs:
+            older_than_days = kwargs.get("older_than_days", older_than_days)
+            purge_all = kwargs.get("purge_all", purge_all)
+        id_list: Optional[List[str]] = None
+        if isinstance(ids, list) and ids:
+            id_list = [str(x) for x in ids]
+        days: Optional[int] = None
+        if older_than_days is not None:
+            try:
+                days = int(older_than_days)
+            except Exception:  # noqa: BLE001
+                days = None
+        if not id_list and days is None and not purge_all:
+            return {"success": False, "message": "未指定要清理的范围"}
+        return purge_trash_items(ids=id_list, older_than_days=days, purge_all=bool(purge_all))
 
     async def list_backup_files(self) -> List[Dict[str, Any]]:
         return list_backup_files()

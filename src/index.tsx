@@ -69,6 +69,9 @@ const restartSteamClient = callable('restart_steam_client');
 const listBackupFiles = callable('list_backup_files');
 const restoreBackupFile = callable('restore_backup_file');
 const cleanupBackupFiles = callable('cleanup_backup_files');
+const listTrashItems = callable('list_trash_items');
+const restoreTrashItem = callable('restore_trash_item');
+const purgeTrashItems = callable('purge_trash_items');
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -275,6 +278,9 @@ function buildDeleteArgs(game: NonSteamGame, opt: DeleteOption) {
     delete_body: !!opt.body,
     delete_saves: !!opt.saves,
     delete_shader: !!opt.shader,
+    // 只用于写进回收站元数据，让还原列表能显示是哪个游戏；
+    // 移除快捷方式仍然不按名称匹配，避免误伤同名条目
+    name: String(game.name || ''),
   };
 }
 
@@ -451,6 +457,9 @@ async function runCleanupFlow(appid: number, opt: DeleteOption, titleHint?: stri
   let preview: string[] = [];
   let normInfo = '';
   let warnText = '';
+  let sizeText = '';
+  // 后端读不到设置时按“无回收站”处理：宁可警告说不可恢复，也别承诺一个可能不存在的后悔药
+  let trashOn = false;
   try {
     const r = unwrapResult(await previewDelete(args));
     preview = (r && r.existing) || [];
@@ -458,6 +467,8 @@ async function runCleanupFlow(appid: number, opt: DeleteOption, titleHint?: stri
       normInfo = `\n(解析路径 exe=${r.normalized_exe || '?'} start=${r.normalized_start || '?'})`;
       const warns = Array.isArray(r.warnings) ? r.warnings.filter(Boolean) : [];
       if (warns.length) warnText = `\n\n注意：\n- ${warns.join('\n- ')}`;
+      trashOn = !!r.trash_enabled;
+      if (r.total_size_human && r.total_size) sizeText = `\n共约 ${r.total_size_human}`;
     }
   } catch (e) {
     LOG('preview failed', e);
@@ -469,9 +480,14 @@ async function runCleanupFlow(appid: number, opt: DeleteOption, titleHint?: stri
       : '未找到可删除文件（可能路径带引号解析失败、文件已不存在，或 StartDir 过浅被保护）。仍会尝试移除 Steam 快捷方式。' +
         normInfo;
 
+  const tailText = trashOn
+    ? '\n\n文件会先移入回收站（同一分区内移动，不占额外空间），删错了可在「清理 → 维护工具 → 回收站」还原。' +
+      '库里的快捷方式不会自动加回来。'
+    : '\n\n此操作不可恢复！（可在维护工具里打开回收站，让删除变成可还原的）';
+
   showConfirmModal({
     title: `${opt.label}：${game.name || titleHint || game.appid}`,
-    body: `将删除：\n${lines}${warnText}\n\n此操作不可恢复！`,
+    body: `将删除：\n${lines}${sizeText}${warnText}${tailText}`,
     onConfirm: async () => {
       try {
         const r = unwrapResult(await deleteNonSteamGame(args));
@@ -489,10 +505,11 @@ async function runCleanupFlow(appid: number, opt: DeleteOption, titleHint?: stri
         const hint = r?.hint ? `\n${r.hint}` : '\n请完全退出 Steam 再打开以刷新库列表。';
         const failed =
           Array.isArray(r?.failed) && r.failed.length ? `\n其它: ${r.failed.slice(0, 2).join('; ')}` : '';
+        const verb = Array.isArray(r?.trashed) && r.trashed.length ? '已移入回收站' : '已删除';
         toast(
           '非Steam清理',
           n > 0
-            ? `已删除 ${n} 项文件/目录。${sc}。${hint}${failed}`
+            ? `${verb} ${n} 项文件/目录。${sc}。${hint}${failed}`
             : `未删除到文件(0 项)。${sc}。${hint}${failed}`
         );
       } catch (e) {
@@ -1646,6 +1663,10 @@ function PluginPanelInner() {
   const [backupFiles, setBackupFiles] = React.useState<any[]>([]);
   const [backupStatus, setBackupStatus] = React.useState('');
   const [backupBusy, setBackupBusy] = React.useState(false);
+  const [trashItems, setTrashItems] = React.useState<any[]>([]);
+  const [trashStatus, setTrashStatus] = React.useState('');
+  const [trashBusy, setTrashBusy] = React.useState(false);
+  const [trashEnabled, setTrashEnabled] = React.useState(true);
 
   const refreshShotList = React.useCallback(async (appid?: number) => {
     setShotLoading(true);
@@ -1810,6 +1831,7 @@ function PluginPanelInner() {
         if (s.max_depth) setMaxDepth(Number(s.max_depth) || 5);
         if (typeof s.auto_extract === 'boolean') setAutoExtract(s.auto_extract);
         if (s.extract_depth || s.extract_depth === 0) setExtractDepth(Number(s.extract_depth) || 0);
+        if (typeof s.trash_enabled === 'boolean') setTrashEnabled(s.trash_enabled);
       } catch (e) {
         LOG('get_scan_settings', e);
       }
@@ -3503,6 +3525,210 @@ function PluginPanelInner() {
                 },
               },
               '清理旧备份（每份保留最近 3 个）'
+            )
+          )
+        : null
+    ),
+    // -------- 回收站 --------
+    activeTab === 'clean' && React.createElement(
+      PanelSection,
+      { title: '回收站' },
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.4 } },
+          '开启后，删除游戏时文件不会真的被抹掉，而是移进所在分区的回收站，删错了可以还原。' +
+            '移动只在同一分区内进行，不额外占空间也不会变慢。超过 14 天的条目会在插件启动时自动清掉。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: btnStyle(trashEnabled),
+            disabled: trashBusy,
+            onClick: () => {
+              const next = !trashEnabled;
+              setTrashEnabled(next);
+              void (async () => {
+                try {
+                  await setScanSettings({ trash_enabled: next });
+                  toast('回收站', next ? '已开启：删除会先移入回收站' : '已关闭：删除将直接抹掉文件');
+                } catch (e) {
+                  setTrashEnabled(!next);
+                  toast('回收站', '设置失败: ' + String(e));
+                }
+              })();
+            },
+          },
+          trashEnabled ? '回收站：已开启（推荐）' : '回收站：已关闭（删除不可恢复）'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: btnStyle(true),
+            disabled: trashBusy,
+            onClick: () => {
+              void (async () => {
+                setTrashBusy(true);
+                try {
+                  const r = unwrapResult(await listTrashItems({}));
+                  const list = (r?.items || []) as any[];
+                  setTrashItems(list);
+                  setTrashStatus(
+                    list.length
+                      ? `回收站里有 ${list.length} 项，共约 ${r?.size_human || '?'}`
+                      : '回收站是空的'
+                  );
+                } catch (e) {
+                  setTrashStatus(String(e));
+                } finally {
+                  setTrashBusy(false);
+                }
+              })();
+            },
+          },
+          trashBusy ? '加载中…' : '查看回收站'
+        )
+      ),
+      trashStatus
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement('div', { style: { fontSize: 12, color: '#9cf' } }, trashStatus)
+          )
+        : null,
+      ...trashItems.slice(0, 20).map((t: any, i: number) => {
+        const refresh = async () => {
+          const r = unwrapResult(await listTrashItems({}));
+          const list = (r?.items || []) as any[];
+          setTrashItems(list);
+          setTrashStatus(
+            list.length ? `回收站里有 ${list.length} 项，共约 ${r?.size_human || '?'}` : '回收站是空的'
+          );
+        };
+        const label =
+          (t.game_name ? String(t.game_name) + ' · ' : '') +
+          (t.kind_label ? String(t.kind_label) + ' · ' : '') +
+          String(t.name || '');
+        return React.createElement(
+          PanelSectionRow,
+          { key: 'trash-' + (t.id || i) },
+          React.createElement(
+            'div',
+            { style: { fontSize: 12, lineHeight: 1.4, marginBottom: 4 } },
+            React.createElement(
+              'div',
+              { style: { opacity: 0.85, wordBreak: 'break-all' } },
+              label +
+                ' · ' +
+                String(t.size_human || '') +
+                ' · ' +
+                new Date((t.deleted_at || 0) * 1000).toLocaleString() +
+                (t.original_exists ? '（原位置已有同名文件）' : '')
+            ),
+            React.createElement(
+              'div',
+              { style: { display: 'flex', gap: 6, marginTop: 4 } },
+              React.createElement(
+                'button',
+                {
+                  style: { ...btnStyle(), flex: 1 },
+                  disabled: trashBusy,
+                  onClick: () => {
+                    showConfirmModalSoft({
+                      title: '还原',
+                      okText: '还原',
+                      body:
+                        `把「${t.name}」放回原位置？\n${t.original || ''}\n\n` +
+                        '注意：只还原文件，Steam 库里的快捷方式不会自动加回来，需要用「扫描添加」重新加入。',
+                      onConfirm: async () => {
+                        setTrashBusy(true);
+                        try {
+                          const rr = unwrapResult(await restoreTrashItem({ item_id: t.id }));
+                          toast('还原', rr?.message || '完成');
+                          await refresh();
+                        } catch (e) {
+                          toast('还原', String(e));
+                        } finally {
+                          setTrashBusy(false);
+                        }
+                      },
+                    });
+                  },
+                },
+                '还原'
+              ),
+              React.createElement(
+                'button',
+                {
+                  style: { ...btnStyle(), flex: 1, background: '#a33' },
+                  disabled: trashBusy,
+                  onClick: () => {
+                    showConfirmModal({
+                      title: '彻底删除',
+                      body: `彻底删除「${t.name}」（约 ${t.size_human}）？\n这一步之后就真的找不回来了。`,
+                      onConfirm: async () => {
+                        setTrashBusy(true);
+                        try {
+                          const rr = unwrapResult(await purgeTrashItems({ ids: [t.id] }));
+                          toast('彻底删除', rr?.message || '完成');
+                          await refresh();
+                        } catch (e) {
+                          toast('彻底删除', String(e));
+                        } finally {
+                          setTrashBusy(false);
+                        }
+                      },
+                    });
+                  },
+                },
+                '彻底删除'
+              )
+            )
+          )
+        );
+      }),
+      trashItems.length
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement(
+              'button',
+              {
+                style: { ...btnStyle(), background: '#a33' },
+                disabled: trashBusy,
+                onClick: () => {
+                  showConfirmModal({
+                    title: '清空回收站',
+                    body: '彻底删除回收站里的全部内容，无法恢复。确定继续？',
+                    onConfirm: async () => {
+                      setTrashBusy(true);
+                      try {
+                        const rr = unwrapResult(await purgeTrashItems({ purge_all: true }));
+                        toast('清空回收站', rr?.message || '完成');
+                        const r = unwrapResult(await listTrashItems({}));
+                        const list = (r?.items || []) as any[];
+                        setTrashItems(list);
+                        setTrashStatus(list.length ? `还剩 ${list.length} 项` : '回收站是空的');
+                      } catch (e) {
+                        toast('清空回收站', String(e));
+                      } finally {
+                        setTrashBusy(false);
+                      }
+                    },
+                  });
+                },
+              },
+              '清空回收站'
             )
           )
         : null

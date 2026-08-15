@@ -2,7 +2,7 @@
 
 Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏。
 
-版本 **1.4.6**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
+版本 **1.4.7**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
 
 ## 功能
 
@@ -17,6 +17,16 @@ Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏�
 同时移除 `shortcuts.vdf` 条目和对应网格图。Steam 运行中会提示：改完后必须完全退出再打开。
 
 入口：游戏详情页、右键菜单、插件面板「已入库非 Steam」。
+
+### 回收站（默认开启）
+
+删除时文件不会被直接抹掉，而是移进**所在分区**的回收站，删错了可以还原：
+
+- 回收站按分区分布：home 分区在 `~/.local/share/NonSteamCleaner/trash`，SD 卡等其它分区在挂载点下的 `.nonsteamcleaner-trash`。同分区内 `mv`，几十 GB 的游戏也是瞬间完成，不额外占空间。
+- 目录名以点开头，扫描添加不会把回收站里的 exe 重新扫出来。
+- 超过 14 天的条目在插件启动时自动清理；也可手动「彻底删除」单项或清空。
+- 还原只恢复文件，**Steam 库里的快捷方式不会自动加回来**，需要用「扫描添加」重新加入。
+- 开关在「清理 → 回收站」。关掉后删除即为直接抹除，不可恢复。
 
 ### 扫描添加
 扫描指定目录下的启动器，勾选后写入 Steam 库。可调扫描深度、自动解压嵌套层数。安装器/补丁/注入器等会尽量过滤。
@@ -69,7 +79,7 @@ sudo cp -a /home/deck/nonsteam-cleaner/main.py \
 
 ## 使用注意
 
-- 删除不可恢复。确认框会列出真实存在的路径。
+- 回收站开启时删除可还原；关掉回收站后删除不可恢复。确认框会列出真实存在的路径。
 - `compatdata/<appid>` 同时包含 Proton 前缀和存档。
 - 受保护目录（`/`、`/home`、`/usr`、`Downloads` 等）不会整目录删除。
 - 改 shortcuts / 图标后请**完全退出 Steam** 再打开。
