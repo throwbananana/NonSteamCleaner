@@ -97,6 +97,35 @@ def resolve_cjk_preset(lang: str) -> Dict[str, str]:
     return {"key": key, **CJK_LANG_PRESETS[key]}
 
 
+# 常见 Windows CJK 系统字体族名。老 galgame 常用的吉里吉里/NScripter/Artemis/Siglus 等引擎
+# 不是 RPG Maker，不会被 install_game_local_cjk_fonts 的 RGSS/HTML Maker 检测命中，
+# 但它们和普通 Windows 程序一样，往往直接按这些标准字体名向系统要字体。之前只有
+# RGSS 检测到的具体字体名才会被补装到 Wine 前缀里；这里给所有游戏都补一套与引擎无关的
+# 常见别名兜底，即使游戏用的不是 RPG Maker 也能覆盖到。
+_COMMON_GAME_FONT_ALIASES: Dict[str, List[str]] = {
+    "zh_CN": [
+        "SimSun", "宋体", "NSimSun", "新宋体", "FangSong", "仿宋",
+        "KaiTi", "楷体", "Microsoft YaHei", "微软雅黑",
+    ],
+    "zh_TW": [
+        "MingLiU", "細明體", "PMingLiU", "新細明體",
+        "Microsoft JhengHei", "微軟正黑體", "SimHei", "黑体",
+    ],
+    "ja_JP": [
+        "MS UI Gothic", "MS Gothic", "ＭＳ ゴシック",
+        "MS PGothic", "ＭＳ Ｐゴシック",
+        "MS Mincho", "ＭＳ 明朝", "MS PMincho", "ＭＳ Ｐ明朝",
+        "Meiryo", "メイリオ",
+    ],
+}
+
+
+def default_common_font_aliases(preset: Dict[str, str]) -> List[Dict[str, str]]:
+    """该语言下与引擎无关的常见系统字体族名兜底列表，供写入 Wine 前缀。"""
+    names = _COMMON_GAME_FONT_ALIASES.get(preset.get("key") or "", [])
+    return [{"family": fam, "file": _safe_font_filename(fam)} for fam in names]
+
+
 def build_cjk_launch_options(existing: str, unix_lang: str) -> str:
     """合并/写入 LANG/LC_ALL 启动项，保留用户其它参数。"""
     existing = (existing or "").strip()
@@ -416,6 +445,42 @@ def _pick_cjk_ttf_source() -> str:
     for c in candidates:
         if c and os.path.isfile(c):
             return c
+    # 写死路径都没找到（比如用的是 Proton-GE 而不是官方 Proton-Experimental，或者
+    # 系统 Noto CJK 装在别的位置）：改用 fontconfig 现查系统里任意已装的 CJK 字体，
+    # 不再要求命中固定路径。
+    return _fc_match_cjk_font()
+
+
+def _fc_match_cjk_font() -> str:
+    """用 fc-match 查系统已安装的 CJK 字体文件路径，作为写死路径找不到时的通用兜底。"""
+    import shutil as _shutil
+    import subprocess
+
+    if not _shutil.which("fc-match"):
+        return ""
+    for query in (
+        "Noto Sans CJK SC",
+        "Noto Sans CJK JP",
+        "Noto Sans CJK",
+        "Noto Serif CJK SC",
+        "WenQuanYi Micro Hei",
+        "WenQuanYi Zen Hei",
+        "sans-serif:lang=zh-cn",
+        "sans-serif:lang=ja",
+    ):
+        try:
+            r = subprocess.run(
+                ["fc-match", "-f", "%{file}", query],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        path = (r.stdout or b"").decode("utf-8", "replace").strip()
+        if path and os.path.isfile(path) and path.lower().endswith((".ttf", ".ttc", ".otf")):
+            return path
     return ""
 
 
@@ -426,6 +491,69 @@ def _ttf_checksum(data: bytes) -> int:
     for i in range(0, len(data), 4):
         s = (s + struct.unpack_from(">I", data, i)[0]) & 0xFFFFFFFF
     return s
+
+
+def _sfnt_search_params(num_tables: int) -> tuple:
+    entry_selector = 0
+    n = num_tables
+    while n > 1:
+        n >>= 1
+        entry_selector += 1
+    search_range = (1 << entry_selector) * 16
+    range_shift = num_tables * 16 - search_range
+    return search_range, entry_selector, range_shift
+
+
+def _first_font_from_ttc(raw: bytes) -> bytes:
+    """把 TTC (TrueType Collection) 的第一个字体还原成独立的 sfnt 字节流。
+
+    SteamOS/Arch 上的 Noto Sans CJK 就是以 .ttc 形式分发的（NotoSansCJK-Regular.ttc）。
+    ttcf 签名不在 clone_ttf_with_family 认识的 (\\x00\\x01\\x00\\x00/true/OTTO) 里，
+    不处理的话会被当成"非标准 TTF"整份原样拷贝，字体内部 name 表还是原始的
+    "Noto Sans CJK ..."，改名完全不生效——游戏按目标字体名(如 SimHei)查询时还是找不到。
+    """
+    import struct as _st
+
+    if len(raw) < 16 or raw[:4] != b"ttcf":
+        return b""
+    try:
+        num_fonts = _st.unpack_from(">I", raw, 8)[0]
+        if num_fonts < 1 or len(raw) < 12 + 4 * num_fonts:
+            return b""
+        offset = _st.unpack_from(">I", raw, 12)[0]
+        if offset + 12 > len(raw):
+            return b""
+        sfnt_ver = raw[offset : offset + 4]
+        num_tables = _st.unpack_from(">H", raw, offset + 4)[0]
+        dir_end = offset + 12 + num_tables * 16
+        if num_tables < 1 or dir_end > len(raw):
+            return b""
+        tables = []
+        for i in range(num_tables):
+            o = offset + 12 + i * 16
+            tag = raw[o : o + 4]
+            _check, toff, tlen = _st.unpack_from(">III", raw, o + 4)
+            if toff + tlen > len(raw):
+                return b""
+            tables.append((tag, raw[toff : toff + tlen]))
+
+        search_range, entry_selector, range_shift = _sfnt_search_params(num_tables)
+        out = bytearray()
+        out += sfnt_ver
+        out += _st.pack(">HHHH", num_tables, search_range, entry_selector, range_shift)
+        dir_pos = len(out)
+        out += b"\x00" * (16 * num_tables)
+        for tag, data in tables:
+            if len(out) % 4:
+                out += b"\x00" * (4 - len(out) % 4)
+            toff = len(out)
+            out += data
+            check = _ttf_checksum(data)
+            _st.pack_into(">4sIII", out, dir_pos, tag, check, toff, len(data))
+            dir_pos += 16
+        return bytes(out)
+    except Exception:  # noqa: BLE001
+        return b""
 
 
 def clone_ttf_with_family(src: str, dest: str, family: str) -> str:
@@ -439,6 +567,10 @@ def clone_ttf_with_family(src: str, dest: str, family: str) -> str:
     if not src or not os.path.isfile(src):
         return "no_src"
     raw = open(src, "rb").read()
+    if len(raw) >= 4 and raw[:4] == b"ttcf":
+        extracted = _first_font_from_ttc(raw)
+        if extracted:
+            raw = extracted
     if len(raw) < 64 or raw[:4] not in (b"\x00\x01\x00\x00", b"true", b"OTTO"):
         # 非标准 TTF，退回拷贝
         try:
@@ -538,6 +670,10 @@ def read_ttf_family_names(path: str) -> List[str]:
         raw = open(path, "rb").read()
     except Exception:  # noqa: BLE001
         return names
+    if len(raw) >= 4 and raw[:4] == b"ttcf":
+        extracted = _first_font_from_ttc(raw)
+        if extracted:
+            raw = extracted
     if len(raw) < 64 or raw[:4] not in (b"\x00\x01\x00\x00", b"true", b"OTTO"):
         return names
     num = struct.unpack_from(">H", raw, 4)[0]
@@ -2178,7 +2314,14 @@ def repair_cjk_fonts_for_game(
 
     game_fonts = install_game_local_cjk_fonts(start_dir=start_dir, exe=exe, preset=preset)
     out["game_fonts"] = game_fonts
-    extra_fams = game_fonts.get("prefix_families") or []
+    # RGSS/HTML Maker 检测到的具体字体名 + 与引擎无关的常见系统字体别名兜底
+    # （吉里吉里/NScripter/Artemis 等非 RPG Maker 的老 galgame 也能覆盖到）。
+    extra_fams: List[Dict[str, str]] = list(game_fonts.get("prefix_families") or [])
+    seen_fams = {str(f.get("family")) for f in extra_fams if isinstance(f, dict)}
+    for item in default_common_font_aliases(preset):
+        if item["family"] not in seen_fams:
+            extra_fams.append(item)
+            seen_fams.add(item["family"])
     font_size_r = patch_game_font_size(start_dir=start_dir, exe=exe, font_size=font_size)
     out["font_size"] = font_size_r
 
@@ -2210,13 +2353,18 @@ def repair_cjk_fonts_for_game(
         write_vdf=write_vdf,
     )
 
+    prefix_changed = sum(len(r.get("changes") or []) for r in out["prefix_results"])
+    game_font_changed = bool(game_fonts.get("changes"))
+    launch_updated = int(out["launch"].get("updated") or 0) > 0
+    font_size_changed = bool(font_size_r.get("changes")) and not font_size_r.get("skipped")
+    any_changed = prefix_changed > 0 or game_font_changed or launch_updated or font_size_changed
+
     out["success"] = True
     parts = [f"[{preset['label']}] {name or aid}"]
     if prefixes:
-        chg_n = sum(len(r.get("changes") or []) for r in out["prefix_results"])
-        parts.append(f"前缀修补 {len(prefixes)} 个({chg_n} 项变更)")
+        parts.append(f"前缀修补 {len(prefixes)} 个({prefix_changed} 项变更)")
     else:
-        parts.append("无前缀(仅写启动项)")
+        parts.append("无前缀(仅写启动项，建议先启动一次游戏生成 Proton 前缀后再修一次)")
     if game_fonts.get("changes"):
         parts.append(f"游戏Fonts补了 {len(game_fonts['changes'])} 项")
     elif game_fonts.get("errors"):
@@ -2228,8 +2376,13 @@ def repair_cjk_fonts_for_game(
     elif font_size_r.get("errors"):
         parts.append("字号:" + ",".join(font_size_r["errors"][:2]))
     parts.append(out["launch"].get("message") or "")
+    # 前缀存在但这次实际什么都没改（多半是已经修过、处于目标状态），
+    # 明确说出来，不要让人以为是刚生效的一次新修复。
+    if not any_changed and prefixes:
+        parts.insert(1, "本次未产生新变更(可能已是目标状态)")
     parts.append("请完全退出 Steam 再启动游戏验证。")
     out["message"] = "；".join(p for p in parts if p)
+    out["changed"] = any_changed
     out["prefix_ok"] = any(bool(r.get("changes")) for r in out["prefix_results"])
     out["launch_ok"] = int(out["launch"].get("updated") or 0) > 0 or any(
         d.get("unchanged") for d in (out["launch"].get("details") or [])
