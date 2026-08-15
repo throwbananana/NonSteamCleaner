@@ -2,7 +2,7 @@
 
 Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏。
 
-版本 **1.4.8**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
+版本 **1.4.9**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
 
 ## 功能
 
@@ -37,6 +37,8 @@ Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏�
 
 ### 扫描添加
 扫描指定目录下的启动器，勾选后写入 Steam 库。可调扫描深度、自动解压嵌套层数。安装器/补丁/注入器等会尽量过滤。
+
+**解压后删除原压缩包**（默认关，勾选开启）：只删本次真正解压成功的包，解压失败或因目标已存在而跳过的一律不动。分卷压缩包（`xxx.7z.001`、`xxx.part1.rar`）会整套删，不会只删第一卷留下一堆孤儿卷。删除走回收站，可还原；回收站关掉时会直接删，界面上有红字提示。
 
 ### 失效 / 重复快捷方式
 - 启动文件已不在磁盘：只从库里移除快捷方式

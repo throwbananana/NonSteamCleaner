@@ -3,7 +3,7 @@
   "display_name": "非Steam游戏清理",
   "author": "you",
   "description": "清理/扫描添加非Steam游戏；失效与重复快捷方式；截图设图标；修复汉化字体(RPG Maker)。",
-  "version": "1.4.8",
+  "version": "1.4.9",
   "api_version": 1,
   "py_version": "3.10",
   "main": "main.py",

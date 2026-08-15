@@ -983,6 +983,7 @@ _TRASH_KIND_LABELS = {
     "saves": "存档/前缀",
     "shader": "着色器缓存",
     "grid": "网格图",
+    "archive": "压缩包",
 }
 
 
@@ -1820,6 +1821,9 @@ def load_settings() -> Dict[str, Any]:
         "userdata_id": "",  # 空=自动选
         "auto_extract": True,  # 扫描时自动解压压缩包
         "extract_depth": 2,  # 压缩包嵌套解压层数
+        # 解压成功后删掉原压缩包（分卷整套删）。默认关：扫描路径默认是 Downloads，
+        # 一开就是自动删用户下载目录里的文件，得让用户自己点开。
+        "delete_archive_after_extract": False,
         "hidden_exes": [],  # 隐藏的启动项（归一化绝对路径）
         # 截图设为图标时的输出最长边（像素）；0=原图不缩放
         "screenshot_max_edge": 768,
@@ -1859,6 +1863,9 @@ def load_settings() -> Dict[str, Any]:
         defaults["screenshot_max_edge"] = sme
     except Exception:  # noqa: BLE001
         defaults["screenshot_max_edge"] = 768
+    defaults["delete_archive_after_extract"] = bool(
+        defaults.get("delete_archive_after_extract", False)
+    )
     defaults["trash_enabled"] = bool(defaults.get("trash_enabled", True))
     try:
         defaults["trash_keep_days"] = max(0, min(365, int(defaults.get("trash_keep_days", 14))))
@@ -1912,6 +1919,8 @@ def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
                     seen.add(n)
                     cleaned.append(n)
             cur["hidden_exes"] = cleaned
+    if "delete_archive_after_extract" in settings:
+        cur["delete_archive_after_extract"] = bool(settings.get("delete_archive_after_extract"))
     if "trash_enabled" in settings:
         cur["trash_enabled"] = bool(settings.get("trash_enabled"))
     if "trash_keep_days" in settings:
@@ -2851,6 +2860,44 @@ def _archive_stem(name: str) -> str:
     return os.path.splitext(name)[0]
 
 
+def _collect_archive_volumes(archive_path: str) -> List[str]:
+    """返回一个压缩包的全部卷。
+
+    分卷压缩包只有第一卷会被交给解压工具（后续卷由 7z/unrar 自动关联），
+    但删除时必须把整套删掉——只删 .001 会留下一堆永远没人管的 .002/.003。
+    """
+    d = os.path.dirname(archive_path)
+    base = os.path.basename(archive_path)
+
+    m = _SPLIT_7Z_RE.match(base)
+    if m:
+        stem = m.group(1)
+        out = []
+        try:
+            for fn in os.listdir(d):
+                m2 = _SPLIT_7Z_RE.match(fn)
+                if m2 and m2.group(1) == stem:
+                    out.append(os.path.join(d, fn))
+        except Exception:  # noqa: BLE001
+            return [archive_path]
+        return sorted(out) or [archive_path]
+
+    m = _SPLIT_RAR_PART_RE.match(base)
+    if m:
+        stem = m.group(1)
+        out = []
+        try:
+            for fn in os.listdir(d):
+                m2 = _SPLIT_RAR_PART_RE.match(fn)
+                if m2 and m2.group(1) == stem:
+                    out.append(os.path.join(d, fn))
+        except Exception:  # noqa: BLE001
+            return [archive_path]
+        return sorted(out) or [archive_path]
+
+    return [archive_path]
+
+
 def _dir_nonempty(path: str) -> bool:
     try:
         if not os.path.isdir(path):
@@ -3032,11 +3079,23 @@ def extract_archives_in_tree(
     scan_path: str,
     max_walk_depth: int = 5,
     nest_depth: int = 2,
+    delete_after: bool = False,
 ) -> Dict[str, Any]:
-    """在扫描目录内查找压缩包并递归解压（嵌套最多 nest_depth 层）。"""
+    """在扫描目录内查找压缩包并递归解压（嵌套最多 nest_depth 层）。
+
+    delete_after=True 时，本次真正解压成功的压缩包会被删掉（分卷整套删）。
+    只删"这一趟确实解压成功"的：跳过的（目标目录已存在）不删，因为那个目录
+    可能是上次解压到一半留下的，标记文件对旧版本遗留目录也只是"非空即认可"，
+    signal 太弱，不足以拿来决定删用户的原始文件。删除走 dispose_path，
+    开着回收站就是可还原的。
+    """
     scan_path = os.path.realpath(os.path.expanduser(scan_path))
     extracted: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
+    removed_archives: List[str] = []
+    removed_bytes = 0
+    delete_failed: List[str] = []
+    use_trash = bool(load_settings().get("trash_enabled", True)) if delete_after else False
     skipped = 0
 
     for level in range(max(0, nest_depth)):
@@ -3091,6 +3150,26 @@ def extract_archives_in_tree(
                 else:
                     level_did += 1
                     extracted.append({"archive": ap, "dest": dest, "level": level, **result})
+                    if delete_after:
+                        for vol in _collect_archive_volumes(ap):
+                            if not os.path.isfile(vol):
+                                continue
+                            size = _path_size(vol)
+                            dr = dispose_path(
+                                vol,
+                                use_trash,
+                                {
+                                    "game_name": os.path.basename(vol),
+                                    "kind": "archive",
+                                    "group": "extract-cleanup",
+                                },
+                            )
+                            if dr.get("ok"):
+                                removed_archives.append(vol)
+                                removed_bytes += size
+                                logger.info("解压后删除压缩包 %s (%s)", vol, dr.get("mode"))
+                            else:
+                                delete_failed.append(f"{vol}: {dr.get('error')}")
             else:
                 failed.append({"archive": ap, "message": result.get("message") or "fail"})
 
@@ -3103,6 +3182,12 @@ def extract_archives_in_tree(
         "skipped_existing": skipped,
         "extracted_count": len(extracted),
         "failed_count": len(failed),
+        "removed_archives": removed_archives,
+        "removed_archive_count": len(removed_archives),
+        "removed_archive_bytes": removed_bytes,
+        "removed_archive_human": _human_size(removed_bytes),
+        "delete_failed": delete_failed[:20],
+        "archive_trash": use_trash,
     }
 
 
@@ -4719,23 +4804,33 @@ def scan_folder_for_games(
     auto_extract: bool = True,
     extract_depth: int = 2,
     include_hidden: bool = False,
+    delete_archive_after_extract: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """扫描目录；可选先解压压缩包；返回启动项列表（含 hidden 标记）。"""
     scan_path = os.path.realpath(os.path.expanduser(scan_path or _DEFAULT_SCAN_PATH))
     if not os.path.isdir(scan_path):
         return {"games": [], "extract": None, "scan_path": scan_path}
 
+    if delete_archive_after_extract is None:
+        delete_archive_after_extract = bool(
+            load_settings().get("delete_archive_after_extract", False)
+        )
+
     extract_info = None
     if auto_extract and extract_depth > 0:
         try:
             extract_info = extract_archives_in_tree(
-                scan_path, max_walk_depth=max_depth, nest_depth=extract_depth
+                scan_path,
+                max_walk_depth=max_depth,
+                nest_depth=extract_depth,
+                delete_after=bool(delete_archive_after_extract),
             )
             logger.info(
-                "extract done: +%s fail=%s skip=%s",
+                "extract done: +%s fail=%s skip=%s removed_archives=%s",
                 extract_info.get("extracted_count"),
                 extract_info.get("failed_count"),
                 extract_info.get("skipped_existing"),
+                extract_info.get("removed_archive_count"),
             )
         except Exception as e:  # noqa: BLE001
             logger.error("extract_archives failed: %s", e)
@@ -5154,6 +5249,9 @@ class Plugin:
         except Exception:  # noqa: BLE001
             extract_depth = 2
         include_hidden = bool(kwargs.get("include_hidden", False))
+        del_archive = bool(settings.get("delete_archive_after_extract", False))
+        if "delete_archive_after_extract" in kwargs:
+            del_archive = bool(kwargs.get("delete_archive_after_extract"))
 
         if not os.path.isdir(os.path.expanduser(path)):
             return {
@@ -5169,6 +5267,7 @@ class Plugin:
             auto_extract=bool(auto_extract),
             extract_depth=extract_depth,
             include_hidden=include_hidden,
+            delete_archive_after_extract=del_archive,
         )
         games = result.get("games") or []
         hidden_games = result.get("hidden_games") or []
@@ -5185,6 +5284,10 @@ class Plugin:
             sc = extract.get("skipped_existing") or 0
             if ec or fc or sc:
                 parts.append(f"解压新{ec}/跳过{sc}/失败{fc}")
+            rc = extract.get("removed_archive_count") or 0
+            if rc:
+                verb = "已回收" if extract.get("archive_trash") else "已删除"
+                parts.append(f"{verb}压缩包 {rc} 个({extract.get('removed_archive_human')})")
         return {
             "success": True,
             "message": "，".join(parts),
@@ -5195,6 +5298,7 @@ class Plugin:
             "max_depth": depth,
             "auto_extract": bool(auto_extract),
             "extract_depth": extract_depth,
+            "delete_archive_after_extract": del_archive,
             "trouble_count": tc,
         }
 

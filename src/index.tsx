@@ -1623,6 +1623,7 @@ function PluginPanelInner() {
   const [selected, setSelected] = React.useState<Record<string, boolean>>({});
   const [hideAdded, setHideAdded] = React.useState(true);
   const [autoExtract, setAutoExtract] = React.useState(true);
+  const [delArchive, setDelArchive] = React.useState(false);
   const [extractDepth, setExtractDepth] = React.useState(2);
   const [showHiddenBar, setShowHiddenBar] = React.useState(false);
   const [pathDraft, setPathDraft] = React.useState('/home/deck/Downloads');
@@ -1839,6 +1840,8 @@ function PluginPanelInner() {
         }
         if (s.max_depth) setMaxDepth(Number(s.max_depth) || 5);
         if (typeof s.auto_extract === 'boolean') setAutoExtract(s.auto_extract);
+        if (typeof s.delete_archive_after_extract === 'boolean')
+          setDelArchive(s.delete_archive_after_extract);
         if (s.extract_depth || s.extract_depth === 0) setExtractDepth(Number(s.extract_depth) || 0);
         if (typeof s.trash_enabled === 'boolean') setTrashEnabled(s.trash_enabled);
       } catch (e) {
@@ -1878,6 +1881,7 @@ function PluginPanelInner() {
           max_depth: maxDepth,
           auto_extract: autoExtract,
           extract_depth: extractDepth,
+          delete_archive_after_extract: delArchive,
         })
       );
       const saved = s?.scan_path || p;
@@ -1901,6 +1905,7 @@ function PluginPanelInner() {
           max_depth: maxDepth,
           auto_extract: autoExtract,
           extract_depth: extractDepth,
+          delete_archive_after_extract: delArchive,
         });
       } catch {
         /* ignore */
@@ -1911,6 +1916,7 @@ function PluginPanelInner() {
           max_depth: maxDepth,
           auto_extract: autoExtract,
           extract_depth: extractDepth,
+          delete_archive_after_extract: delArchive,
           include_hidden: false,
         })
       );
@@ -1924,8 +1930,12 @@ function PluginPanelInner() {
       }
       const ex = r?.extract;
       if (ex && (ex.extracted_count || ex.failed_count || ex.skipped_existing)) {
+        const rc = ex.removed_archive_count || 0;
         setExtractInfo(
-          `解压：新${ex.extracted_count || 0} / 已存在跳过${ex.skipped_existing || 0} / 失败${ex.failed_count || 0}`
+          `解压：新${ex.extracted_count || 0} / 已存在跳过${ex.skipped_existing || 0} / 失败${ex.failed_count || 0}` +
+            (rc
+              ? `；${ex.archive_trash ? '已回收' : '已删除'}压缩包 ${rc} 个（${ex.removed_archive_human || ''}）`
+              : '')
         );
       }
       // 默认勾选高分且未添加；-trouble 问题项不自动勾选
@@ -2838,6 +2848,46 @@ function PluginPanelInner() {
           '扫描时自动解压压缩包（zip/7z/rar/tar，可递归）'
         )
       ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'label',
+          {
+            style: {
+              fontSize: 13,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              opacity: autoExtract ? 1 : 0.5,
+            },
+          },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: delArchive,
+            disabled: !autoExtract,
+            onChange: (e: any) => {
+              const next = !!e.target.checked;
+              setDelArchive(next);
+              void setScanSettings({ delete_archive_after_extract: next }).catch(() => undefined);
+            },
+          }),
+          '解压成功后删除原压缩包（分卷整套删）'
+        )
+      ),
+      autoExtract && delArchive
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement(
+              'div',
+              { style: { fontSize: 11, opacity: 0.75, lineHeight: 1.4, marginTop: -2 } },
+              trashEnabled
+                ? '压缩包会进回收站，可以还原。只删本次真正解压成功的；失败或跳过的不动。'
+                : '⚠ 回收站已关闭，压缩包会被直接删除且无法恢复。建议先到「清理 → 回收站」打开。'
+            )
+          )
+        : null,
       React.createElement(
         PanelSectionRow,
         null,
