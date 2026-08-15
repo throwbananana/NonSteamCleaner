@@ -2,7 +2,7 @@
 
 Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏。
 
-版本 **1.4.7**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
+版本 **1.4.8**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
 
 ## 功能
 
@@ -27,6 +27,13 @@ Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏�
 - 超过 14 天的条目在插件启动时自动清理；也可手动「彻底删除」单项或清空。
 - 还原只恢复文件，**Steam 库里的快捷方式不会自动加回来**，需要用「扫描添加」重新加入。
 - 开关在「清理 → 回收站」。关掉后删除即为直接抹除，不可恢复。
+
+### 磁盘占用 / 孤儿数据
+
+- **统计磁盘占用**：按「本体 + 存档/前缀 + 着色器缓存」算出每个非 Steam 游戏占了多少空间，从大到小排。共用目录的游戏会标注，总计里只算一次。
+- **孤儿数据**：手动删过游戏、或改过名字/路径之后留下的 `compatdata` 前缀、着色器缓存和封面图，库里已经没有快捷方式认领它们。可按类别一键清理（走回收站）。
+
+只认非 Steam 的 appid（`>= 0x80000000`），正牌 Steam 游戏的数据不会被碰。读不到 `shortcuts.vdf` 或有文件解析失败时会拒绝分析——已知清单不完整的情况下判孤儿等于乱删。
 
 ### 扫描添加
 扫描指定目录下的启动器，勾选后写入 Steam 库。可调扫描深度、自动解压嵌套层数。安装器/补丁/注入器等会尽量过滤。

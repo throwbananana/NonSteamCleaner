@@ -1449,6 +1449,308 @@ def dispose_path(path: str, use_trash: bool, meta: Optional[Dict[str, Any]] = No
 
 
 # ---------------------------------------------------------------------------
+# 磁盘占用分析 / 孤儿数据
+# ---------------------------------------------------------------------------
+_ORPHAN_KINDS = ("compatdata", "shadercache")
+
+
+def _shortcuts_scan_health() -> Dict[str, Any]:
+    """统计 shortcuts.vdf 有几个、能读几个。
+
+    孤儿判定的前提是"这份已入库清单是完整可信的"。如果一个 shortcuts.vdf 都
+    找不到、或者有文件读失败，已知 appid 集合就是残缺的，此时任何 compatdata
+    都会显得"没人认领"——照着删就是把好游戏的存档删光。所以宁可拒绝分析。
+    """
+    root = find_steam_root()
+    out = {"files": 0, "parsed": 0, "failed": 0}
+    if not root:
+        return out
+    userdata = os.path.join(root, "userdata")
+    if not os.path.isdir(userdata):
+        return out
+    try:
+        sids = os.listdir(userdata)
+    except Exception:  # noqa: BLE001
+        return out
+    for sid in sids:
+        sc = os.path.join(userdata, sid, "config", "shortcuts.vdf")
+        if not os.path.isfile(sc):
+            continue
+        out["files"] += 1
+        try:
+            with open(sc, "rb") as fp:
+                _read_node(fp)
+            out["parsed"] += 1
+        except Exception:  # noqa: BLE001
+            out["failed"] += 1
+    return out
+
+
+def _appid_from_dir_name(name: str) -> Optional[int]:
+    try:
+        v = int(str(name).strip())
+    except (TypeError, ValueError):
+        return None
+    return normalize_appid(v)
+
+
+def analyze_nonsteam_disk_usage() -> Dict[str, Any]:
+    """统计每个非 Steam 游戏占了多少磁盘：本体 + 存档/前缀 + 着色器缓存。"""
+    games = list_all_nonsteam_games()
+    rows: List[Dict[str, Any]] = []
+    counted: set = set()  # 已计入总计的真实路径，避免共用目录重复累加
+    grand = 0
+
+    for g in games:
+        appid = normalize_appid(g.get("appid"))
+        exe = _normalize(g.get("exe") or "") or ""
+        start = _normalize(g.get("start_dir") or "") or ""
+
+        body_path = ""
+        if start and os.path.isdir(start):
+            body_path = start
+        elif exe and os.path.isfile(exe):
+            body_path = exe
+
+        shared = start_dir_shared_with_others(start, appid) if start else []
+
+        def _add(path: str) -> int:
+            """算大小；同一路径只往总计里加一次。"""
+            nonlocal grand
+            if not path or not os.path.lexists(path):
+                return 0
+            size = _path_size(path)
+            try:
+                rp = os.path.realpath(path)
+            except Exception:  # noqa: BLE001
+                rp = path
+            if rp not in counted:
+                counted.add(rp)
+                grand += size
+            return size
+
+        body_size = _add(body_path)
+        saves_size = 0
+        for cd in _collect_prefix_dirs(appid, "compatdata"):
+            saves_size += _add(cd)
+        shader_size = 0
+        for sc in _collect_prefix_dirs(appid, "shadercache"):
+            shader_size += _add(sc)
+
+        total = body_size + saves_size + shader_size
+        rows.append(
+            {
+                "appid": appid,
+                "name": g.get("name") or "",
+                "exe": exe,
+                "start_dir": start,
+                "userdata_id": g.get("userdata_id") or "",
+                "key": g.get("key") or "",
+                "body_path": body_path,
+                "body_size": body_size,
+                "body_size_human": _human_size(body_size),
+                "body_missing": not body_path,
+                "body_shared": bool(shared),
+                "saves_size": saves_size,
+                "saves_size_human": _human_size(saves_size),
+                "shader_size": shader_size,
+                "shader_size_human": _human_size(shader_size),
+                "total": total,
+                "total_human": _human_size(total),
+            }
+        )
+
+    rows.sort(key=lambda x: -int(x.get("total") or 0))
+    return {
+        "success": True,
+        "games": rows,
+        "count": len(rows),
+        "total": grand,
+        "total_human": _human_size(grand),
+    }
+
+
+def find_orphan_data() -> Dict[str, Any]:
+    """找出没有任何快捷方式认领的非 Steam 数据：compatdata / shadercache / 网格图。
+
+    只看非 Steam appid（>= 0x80000000）。正牌 Steam 游戏的 compatdata 用的是普通
+    appid，绝对不能碰——哪怕它当前没安装。
+    """
+    health = _shortcuts_scan_health()
+    if health["files"] == 0:
+        return {
+            "success": False,
+            "message": "没有找到任何 shortcuts.vdf，无法判断哪些数据是孤儿（拒绝分析）",
+            "health": health,
+        }
+    if health["failed"]:
+        return {
+            "success": False,
+            "message": f"有 {health['failed']} 个 shortcuts.vdf 读取失败，已知游戏清单不完整，拒绝分析",
+            "health": health,
+        }
+
+    known = {normalize_appid(g.get("appid")) for g in list_all_nonsteam_games()}
+    items: List[Dict[str, Any]] = []
+
+    for lib_root in iter_steam_library_roots():
+        for kind in _ORPHAN_KINDS:
+            base = os.path.join(lib_root, "steamapps", kind)
+            if not os.path.isdir(base):
+                continue
+            try:
+                names = os.listdir(base)
+            except Exception:  # noqa: BLE001
+                continue
+            for name in names:
+                path = os.path.join(base, name)
+                if not os.path.isdir(path):
+                    continue
+                aid = _appid_from_dir_name(name)
+                if aid is None or not is_nonsteam_shortcut_appid(aid):
+                    continue
+                if aid in known:
+                    continue
+                if not _safe_to_delete(path):
+                    continue
+                size = _path_size(path)
+                try:
+                    mtime = int(os.stat(path).st_mtime)
+                except Exception:  # noqa: BLE001
+                    mtime = 0
+                items.append(
+                    {
+                        "path": os.path.realpath(path),
+                        "kind": kind,
+                        "kind_label": "存档/前缀" if kind == "compatdata" else "着色器缓存",
+                        "appid": aid,
+                        "size": size,
+                        "size_human": _human_size(size),
+                        "mtime": mtime,
+                    }
+                )
+
+    # 网格图：userdata/<sid>/config/grid/<appid>*.*
+    root = find_steam_root()
+    if root:
+        userdata = os.path.join(root, "userdata")
+        if os.path.isdir(userdata):
+            try:
+                sids = os.listdir(userdata)
+            except Exception:  # noqa: BLE001
+                sids = []
+            for sid in sids:
+                grid_dir = os.path.join(userdata, sid, "config", "grid")
+                if not os.path.isdir(grid_dir):
+                    continue
+                try:
+                    files = os.listdir(grid_dir)
+                except Exception:  # noqa: BLE001
+                    continue
+                for fn in files:
+                    mobj = re.match(r"^(\d+)(?:[p_]|\.)", fn)
+                    if not mobj:
+                        continue
+                    aid = _appid_from_dir_name(mobj.group(1))
+                    if aid is None or not is_nonsteam_shortcut_appid(aid):
+                        continue
+                    if aid in known:
+                        continue
+                    path = os.path.join(grid_dir, fn)
+                    if not os.path.isfile(path) or not _safe_to_delete(path):
+                        continue
+                    size = _path_size(path)
+                    try:
+                        mtime = int(os.stat(path).st_mtime)
+                    except Exception:  # noqa: BLE001
+                        mtime = 0
+                    items.append(
+                        {
+                            "path": os.path.realpath(path),
+                            "kind": "grid",
+                            "kind_label": "网格图",
+                            "appid": aid,
+                            "size": size,
+                            "size_human": _human_size(size),
+                            "mtime": mtime,
+                        }
+                    )
+
+    items.sort(key=lambda x: -int(x.get("size") or 0))
+    total = sum(int(x.get("size") or 0) for x in items)
+    return {
+        "success": True,
+        "items": items,
+        "count": len(items),
+        "total": total,
+        "total_human": _human_size(total),
+        "health": health,
+        "message": (
+            f"找到 {len(items)} 项无人认领的数据，共约 {_human_size(total)}"
+            if items
+            else "没有找到孤儿数据"
+        ),
+    }
+
+
+def purge_orphan_data(paths: List[str]) -> Dict[str, Any]:
+    """删除孤儿数据。前端传来的路径一律重新校验一遍，不直接照单执行。"""
+    want = set()
+    for p in paths or []:
+        n = _normalize(str(p))
+        if n:
+            want.add(n)
+    if not want:
+        return {"success": False, "message": "没有指定要清理的项目"}
+
+    found = find_orphan_data()
+    if not found.get("success"):
+        return found
+    allowed = {str(i["path"]): i for i in found.get("items") or []}
+
+    use_trash = bool(load_settings().get("trash_enabled", True))
+    group_id = _new_trash_id()
+    removed: List[str] = []
+    failed: List[str] = []
+    freed = 0
+    for p in want:
+        info = allowed.get(p)
+        if not info:
+            failed.append(f"{p}: 不在孤儿数据列表中，已跳过")
+            continue
+        r = dispose_path(
+            p,
+            use_trash,
+            {
+                "game_name": f"孤儿数据 {info.get('appid')}",
+                "appid": info.get("appid"),
+                "kind": "saves" if info.get("kind") == "compatdata" else (
+                    "shader" if info.get("kind") == "shadercache" else "grid"
+                ),
+                "group": group_id,
+            },
+        )
+        if r.get("ok"):
+            removed.append(p)
+            freed += int(info.get("size") or 0)
+        else:
+            failed.append(f"{p}: {r.get('error')}")
+
+    verb = "已移入回收站" if use_trash else "已删除"
+    return {
+        "success": True,
+        "removed_count": len(removed),
+        "removed": removed[:50],
+        "failed": failed[:20],
+        "freed": freed,
+        "freed_human": _human_size(freed),
+        "trash_enabled": use_trash,
+        "message": f"{verb} {len(removed)} 项，约 {_human_size(freed)}"
+        + (f"，{len(failed)} 项失败" if failed else ""),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 扫描 / 添加非 Steam 游戏
 # ---------------------------------------------------------------------------
 _DEFAULT_SCAN_PATH = os.path.expanduser("~/Downloads")
@@ -5707,6 +6009,23 @@ class Plugin:
         """强制结束 Steam 客户端进程，避免它退出时把内存里的旧 shortcuts/注册表
         数据重新写回磁盘，盖掉插件刚做的改动。需要用户在前端明确点击确认。"""
         return restart_steam_client()
+
+    # ---- 磁盘占用 / 孤儿数据 ----
+    async def analyze_disk_usage(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        return analyze_nonsteam_disk_usage()
+
+    async def find_orphan_data(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        return find_orphan_data()
+
+    async def purge_orphan_data(self, paths: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        if isinstance(paths, dict):
+            kwargs = {**paths, **kwargs}
+            paths = kwargs.get("paths")
+        if paths is None:
+            paths = kwargs.get("paths") or []
+        if not isinstance(paths, list):
+            return {"success": False, "message": "paths 必须是路径数组"}
+        return purge_orphan_data([str(p) for p in paths])
 
     # ---- 回收站 ----
     async def list_trash_items(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:

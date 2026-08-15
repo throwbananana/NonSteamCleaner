@@ -62,6 +62,16 @@ Every backend RPC method is exposed by adding an `async def` to `class Plugin`, 
 
 Deleting a non-Steam game is parameterized by three independent booleans — body / saves / shader — combined into 4 preset options in both `src/index.tsx` (`OPTIONS` array) and mirrored server-side logic. `_compute_targets_detailed()` is the real implementation and returns `(path, kind)` pairs (`body`/`saves`/`shader`/`grid`) so the kind can be recorded in trash metadata; `_compute_targets()` is a thin wrapper returning bare paths for `preview_delete`. "Saves" and "shader" both key off `compatdata/<appid>`/shader-cache lookups in `_collect_prefix_dirs`; deleting "saves" also destroys the Proton prefix (registry/config), not just save files — this is a known, documented (not accidental) side effect. `preview_delete` must be called before `delete_non_steam_game` in the UI flow so the confirmation dialog can list real, resolved paths (never delete based on unresolved/relative paths).
 
+### Disk usage & orphan data
+
+`analyze_nonsteam_disk_usage()` sizes every shortcut's body / `compatdata` / shadercache; paths are de-duplicated by realpath so a StartDir shared by several shortcuts is counted once in the grand total while each row still reports its own size (rows carry `body_shared` for the UI to label).
+
+`find_orphan_data()` reports `compatdata`/`shadercache` dirs and `grid` images whose appid is a non-Steam shortcut appid that no longer appears in any `shortcuts.vdf`. Two invariants keep this from becoming a data-loss feature, and both must be preserved:
+1. **Only non-Steam appids** (`is_nonsteam_shortcut_appid`, `>= 0x80000000`) are ever considered — a real Steam game's `compatdata` must never be touched, even when that game is uninstalled.
+2. **It refuses to run on an incomplete picture** — `_shortcuts_scan_health()` must find at least one `shortcuts.vdf` and have zero parse failures. If the known-appid set were partially built, every live prefix would look unclaimed.
+
+`purge_orphan_data(paths)` re-runs the full detection server-side and only acts on paths present in that fresh result; the client's path list is never trusted. Removals go through `dispose_path`, so they land in the recycle bin like any other delete.
+
 ### Distinguishing "missing" vs "duplicate" shortcuts
 
 These are separate cleanup features, not the same code path: `find_missing_nonsteam_games`/`purge_missing_nonsteam_games` handle shortcuts whose target exe no longer exists on disk (shortcut-only removal, never touches files); `find_duplicate_nonsteam_games`/`purge_duplicate_shortcuts` handle the same exe added more than once (keeps one shortcut, also file-safe).

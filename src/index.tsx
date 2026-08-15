@@ -69,6 +69,9 @@ const restartSteamClient = callable('restart_steam_client');
 const listBackupFiles = callable('list_backup_files');
 const restoreBackupFile = callable('restore_backup_file');
 const cleanupBackupFiles = callable('cleanup_backup_files');
+const analyzeDiskUsage = callable('analyze_disk_usage');
+const findOrphanData = callable('find_orphan_data');
+const purgeOrphanData = callable('purge_orphan_data');
 const listTrashItems = callable('list_trash_items');
 const restoreTrashItem = callable('restore_trash_item');
 const purgeTrashItems = callable('purge_trash_items');
@@ -1663,6 +1666,12 @@ function PluginPanelInner() {
   const [backupFiles, setBackupFiles] = React.useState<any[]>([]);
   const [backupStatus, setBackupStatus] = React.useState('');
   const [backupBusy, setBackupBusy] = React.useState(false);
+  const [usageRows, setUsageRows] = React.useState<any[]>([]);
+  const [usageTotal, setUsageTotal] = React.useState('');
+  const [usageBusy, setUsageBusy] = React.useState(false);
+  const [orphans, setOrphans] = React.useState<any[]>([]);
+  const [orphanStatus, setOrphanStatus] = React.useState('');
+  const [orphanBusy, setOrphanBusy] = React.useState(false);
   const [trashItems, setTrashItems] = React.useState<any[]>([]);
   const [trashStatus, setTrashStatus] = React.useState('');
   const [trashBusy, setTrashBusy] = React.useState(false);
@@ -3528,6 +3537,206 @@ function PluginPanelInner() {
             )
           )
         : null
+    ),
+    // -------- 磁盘占用 / 孤儿数据 --------
+    activeTab === 'clean' && React.createElement(
+      PanelSection,
+      { title: '磁盘占用' },
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.4 } },
+          '统计每个非 Steam 游戏占了多少空间（本体 + 存档/前缀 + 着色器缓存），按大小排序。' +
+            '游戏多的时候要扫几秒。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: btnStyle(true),
+            disabled: usageBusy,
+            onClick: () => {
+              void (async () => {
+                setUsageBusy(true);
+                setUsageTotal('统计中，请稍候…');
+                try {
+                  const r = unwrapResult(await analyzeDiskUsage({}));
+                  const list = (r?.games || []) as any[];
+                  setUsageRows(list);
+                  setUsageTotal(`${list.length} 个游戏，合计约 ${r?.total_human || '?'}`);
+                } catch (e) {
+                  setUsageTotal(String(e));
+                } finally {
+                  setUsageBusy(false);
+                }
+              })();
+            },
+          },
+          usageBusy ? '统计中…' : '统计磁盘占用'
+        )
+      ),
+      usageTotal
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement('div', { style: { fontSize: 12, color: '#9cf' } }, usageTotal)
+          )
+        : null,
+      ...usageRows.slice(0, 20).map((g: any, i: number) =>
+        React.createElement(
+          PanelSectionRow,
+          { key: 'usage-' + (g.appid || i) },
+          React.createElement(
+            'div',
+            { style: { fontSize: 12, lineHeight: 1.4, marginBottom: 2 } },
+            React.createElement(
+              'div',
+              { style: { display: 'flex', justifyContent: 'space-between', gap: 8 } },
+              React.createElement(
+                'span',
+                { style: { wordBreak: 'break-all', flex: 1 } },
+                `${i + 1}. ${g.name || g.appid}`
+              ),
+              React.createElement(
+                'span',
+                { style: { opacity: 0.95, whiteSpace: 'nowrap' } },
+                String(g.total_human || '')
+              )
+            ),
+            React.createElement(
+              'div',
+              { style: { opacity: 0.65, fontSize: 11 } },
+              `本体 ${g.body_size_human} · 存档 ${g.saves_size_human} · 着色器 ${g.shader_size_human}` +
+                (g.body_shared ? ' · 与其它快捷方式共用目录' : '') +
+                (g.body_missing ? ' · 本体文件已不存在' : '')
+            )
+          )
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'div',
+          { style: { fontSize: 12, opacity: 0.9, lineHeight: 1.4, marginTop: 6 } },
+          '孤儿数据：手动删过游戏、或改过名字/路径之后留下的存档前缀、着色器缓存和封面图，' +
+            '库里已经没有任何快捷方式对应它们。只认非 Steam 的 appid，正牌 Steam 游戏的数据不会被碰。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        null,
+        React.createElement(
+          'button',
+          {
+            style: btnStyle(true),
+            disabled: orphanBusy,
+            onClick: () => {
+              void (async () => {
+                setOrphanBusy(true);
+                try {
+                  const r = unwrapResult(await findOrphanData({}));
+                  if (r && r.success === false) {
+                    setOrphans([]);
+                    setOrphanStatus(r.message || '无法分析');
+                  } else {
+                    setOrphans((r?.items || []) as any[]);
+                    setOrphanStatus(r?.message || '');
+                  }
+                } catch (e) {
+                  setOrphanStatus(String(e));
+                } finally {
+                  setOrphanBusy(false);
+                }
+              })();
+            },
+          },
+          orphanBusy ? '扫描中…' : '扫描孤儿数据'
+        )
+      ),
+      orphanStatus
+        ? React.createElement(
+            PanelSectionRow,
+            null,
+            React.createElement('div', { style: { fontSize: 12, color: '#9cf' } }, orphanStatus)
+          )
+        : null,
+      ...(() => {
+        if (!orphans.length) return [];
+        const kinds = [
+          { key: 'compatdata', label: '存档/前缀' },
+          { key: 'shadercache', label: '着色器缓存' },
+          { key: 'grid', label: '网格图' },
+        ];
+        const refresh = async () => {
+          const r = unwrapResult(await findOrphanData({}));
+          setOrphans((r?.items || []) as any[]);
+          setOrphanStatus(r?.message || '');
+        };
+        const rows = kinds
+          .map((k) => {
+            const list = orphans.filter((o: any) => o.kind === k.key);
+            if (!list.length) return null;
+            const bytes = list.reduce((a: number, b: any) => a + (Number(b.size) || 0), 0);
+            const human =
+              bytes >= 1024 * 1024 * 1024
+                ? (bytes / 1024 / 1024 / 1024).toFixed(1) + ' GB'
+                : (bytes / 1024 / 1024).toFixed(1) + ' MB';
+            return React.createElement(
+              PanelSectionRow,
+              { key: 'orph-' + k.key },
+              React.createElement(
+                'div',
+                { style: { fontSize: 12, lineHeight: 1.4, marginBottom: 4 } },
+                React.createElement(
+                  'div',
+                  { style: { opacity: 0.85 } },
+                  `${k.label}：${list.length} 项，约 ${human}`
+                ),
+                React.createElement(
+                  'button',
+                  {
+                    style: { ...btnStyle(), marginTop: 4 },
+                    disabled: orphanBusy,
+                    onClick: () => {
+                      showConfirmModalSoft({
+                        title: `清理${k.label}`,
+                        okText: '清理',
+                        body:
+                          `清理 ${list.length} 项无人认领的${k.label}，约 ${human}。\n` +
+                          (trashEnabled
+                            ? '开着回收站，这些数据会先移进回收站，可以还原。'
+                            : '回收站已关闭，将直接删除，不可恢复。'),
+                        onConfirm: async () => {
+                          setOrphanBusy(true);
+                          try {
+                            const rr = unwrapResult(
+                              await purgeOrphanData({ paths: list.map((o: any) => o.path) })
+                            );
+                            toast('清理孤儿数据', rr?.message || '完成');
+                            await refresh();
+                          } catch (e) {
+                            toast('清理孤儿数据', String(e));
+                          } finally {
+                            setOrphanBusy(false);
+                          }
+                        },
+                      });
+                    },
+                  },
+                  `清理这些${k.label}`
+                )
+              )
+            );
+          })
+          .filter(Boolean);
+        return rows as any[];
+      })(),
     ),
     // -------- 回收站 --------
     activeTab === 'clean' && React.createElement(
