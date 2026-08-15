@@ -2,7 +2,7 @@
 
 Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏。
 
-版本 **1.3.0**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
+版本 **1.4.6**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
 
 ## 功能
 
