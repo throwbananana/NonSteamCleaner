@@ -2,7 +2,7 @@
 
 Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏。
 
-版本 **1.4.9**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
+版本 **1.5.0**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
 
 ## 功能
 
@@ -55,6 +55,33 @@ Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏�
 - 中文补丁额外映射黑体 / SimHei
 
 详情页和右键可选语言；插件面板可批量修。
+
+#### 自动检测该用哪个语言
+
+选错语言不只是文字花掉 —— 老游戏是 ANSI 程序，读自己的路径、配置、数据文件名
+都要过一遍系统 ANSI 代码页，选错会直接**找不到自己的数据、建不出存档目录**，
+启动即弹框退出，而且什么日志都不留。
+
+「自动检测该用哪个语言」按判据强弱给结论，并列出依据：
+
+1. **硬证据** —— 引擎配置里写的数据文件名，用哪个代码页解码才对得上磁盘上
+   真实存在的文件。对不上游戏就读不到自己的数据，一票定音。
+2. 启动的 exe 自带 `CN` / `CHS` 汉化标记（同目录常常既有原版又有汉化版 exe，
+   而配置文件记的是原版的信息，所以这条压过第 1 条）。
+3. 数据文件名是「真文本」还是「乱码」：`三匹が.ain` 是真日文名（要 Shift-JIS），
+   `儔儞僗俇偦偺屻.ain` 是 Shift-JIS 字节被 GBK 解读的产物（要 GBK）。
+4. 配置里的游戏名 —— 它决定存档目录名。
+5. 随包字体、说明文档、文件名整体倾向（弱证据，兜底）。
+
+插件面板上的按钮可以一次扫全部游戏，只读不改动。
+
+#### 路径检查
+
+**修复前会先检查游戏路径能否被目标代码页表示，表示不了就拒绝修改。**
+例如 `兰斯01` 里的「兰」在 Shift-JIS(cp932) 和 Big5(cp950) 中都不存在，
+选日文预设时路径会变成 `?斯01`，游戏找不到自己的目录 —— 这种情况装什么字体
+都没用，只能先把目录改成英文（纯 ASCII 最保险）。批量修复时这类游戏会被
+单独列出来跳过，不会被静默改坏。
 
 ### 其它
 - 隐藏栏：扫描误报可藏起来

@@ -56,6 +56,7 @@ const unmarkScanItemsTrouble = callable('unmark_scan_items_trouble');
 const repairNonsteamIcons = callable('repair_nonsteam_icons');
 const repairCjkFonts = callable('repair_cjk_fonts');
 const getCjkFontLangOptions = callable('get_cjk_font_lang_options');
+const detectCjkLang = callable('detect_cjk_lang');
 const setIconFromScreenshot = callable('set_icon_from_screenshot');
 const captureAndSetIcon = callable('capture_and_set_icon');
 const setIconFromLatestScreenshot = callable('set_icon_from_latest_screenshot');
@@ -643,6 +644,8 @@ function GameCleanupPanel({ appId, title }: { appId: number; title?: string }) {
   const [shotSize, setShotSize] = React.useState(768);
   const [cjkLang, setCjkLang] = React.useState('zh_CN');
   const [cjkFontSize, setCjkFontSize] = React.useState(24);
+  const [cjkDetect, setCjkDetect] = React.useState<any>(null);
+  const [cjkDetecting, setCjkDetecting] = React.useState(false);
   const [cropMode, setCropMode] = React.useState('portrait');
   const [cropAlign, setCropAlign] = React.useState('center');
 
@@ -971,6 +974,83 @@ function GameCleanupPanel({ appId, title }: { appId: number; title?: string }) {
           { style: { fontSize: 12, opacity: 0.85, margin: '8px 0 4px' } },
           '缺字或变成 ?? 时，先选语言再修复汉化字体：'
         ),
+        React.createElement(
+          'button',
+          {
+            key: 'nsc-cjk-detect',
+            disabled: cjkDetecting,
+            onClick: () => {
+              void (async () => {
+                setCjkDetecting(true);
+                try {
+                  const r = unwrapResult(await detectCjkLang({ appid: appId }));
+                  const hit = (r?.results || [])[0];
+                  setCjkDetect(hit || null);
+                  if (hit?.lang) setCjkLang(hit.lang);
+                } catch (e) {
+                  setCjkDetect({ error: String(e) });
+                } finally {
+                  setCjkDetecting(false);
+                }
+              })();
+            },
+            style: {
+              width: '100%',
+              padding: '8px 10px',
+              marginBottom: 6,
+              borderRadius: 4,
+              border: '1px solid #456',
+              background: '#1b2838',
+              color: '#fff',
+              fontSize: 13,
+            },
+          },
+          cjkDetecting ? '检测中…' : '自动检测该用哪个语言'
+        ),
+        cjkDetect &&
+          React.createElement(
+            'div',
+            {
+              key: 'nsc-cjk-detect-out',
+              style: {
+                fontSize: 11,
+                lineHeight: 1.5,
+                marginBottom: 6,
+                padding: '6px 8px',
+                borderRadius: 4,
+                background: '#0e1620',
+                border:
+                  cjkDetect.path_check && !cjkDetect.path_check.ok
+                    ? '1px solid #d66'
+                    : '1px solid #345',
+              },
+            },
+            cjkDetect.error
+              ? '检测失败：' + cjkDetect.error
+              : React.createElement(
+                  'div',
+                  null,
+                  React.createElement(
+                    'div',
+                    { style: { color: '#9cf', marginBottom: 2 } },
+                    `建议：${cjkDetect.lang_label || cjkDetect.lang}（把握 ${cjkDetect.confidence}）`
+                  ),
+                  ...(cjkDetect.reasons || []).map((x: string, i: number) =>
+                    React.createElement(
+                      'div',
+                      { key: 'r' + i, style: { opacity: 0.8 } },
+                      '· ' + x
+                    )
+                  ),
+                  cjkDetect.path_check && !cjkDetect.path_check.ok
+                    ? React.createElement(
+                        'div',
+                        { style: { color: '#f88', marginTop: 4 } },
+                        '⚠ ' + cjkDetect.path_check.message
+                      )
+                    : null
+                )
+          ),
         React.createElement(
           'div',
           { style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 } },
@@ -1642,6 +1722,9 @@ function PluginPanelInner() {
   const [cjkFontSize, setCjkFontSize] = React.useState(24);
   const [cjkRepairing, setCjkRepairing] = React.useState(false);
   const [cjkStatus, setCjkStatus] = React.useState('');
+  const [cjkScan, setCjkScan] = React.useState<any[] | null>(null);
+  const [cjkScanning, setCjkScanning] = React.useState(false);
+  const [cjkOverwrite, setCjkOverwrite] = React.useState(false);
 
   // 左侧插件：截图设为图标
   const [iconTargetAppid, setIconTargetAppid] = React.useState<number>(0);
@@ -4094,7 +4177,9 @@ function PluginPanelInner() {
                   okText: '开始修复',
                   body:
                     `将对库中全部非 Steam 游戏按「${langLabel}」修复${sizeHint}。\n` +
-                    `已单独设过日文/繁中启动项的游戏不会被覆盖。\n` +
+                    (cjkOverwrite
+                      ? `已设过别的语言的游戏也会被改成「${langLabel}」。\n`
+                      : `已单独设过日文/繁中启动项的游戏不会被覆盖（要改请先勾选「覆盖已设语言」）。\n`) +
                     `建议优先用「仅修复已有 Proton 前缀」。\n` +
                     `完成后请完全退出 Steam 再玩。`,
                   onConfirm: async () => {
@@ -4106,6 +4191,7 @@ function PluginPanelInner() {
                           lang: cjkLang,
                           only_with_prefix: false,
                           font_size: cjkFontSize,
+                          overwrite_lang: cjkOverwrite,
                         })
                       );
                       setCjkStatus(r?.message || '完成');
@@ -4121,7 +4207,11 @@ function PluginPanelInner() {
               })();
             },
           },
-          cjkRepairing ? '修复中…' : '批量修复（不覆盖已有其它语言）'
+          cjkRepairing
+            ? '修复中…'
+            : cjkOverwrite
+            ? '批量修复（覆盖已设语言）'
+            : '批量修复（不覆盖已有其它语言）'
         )
       ),
       React.createElement(
@@ -4149,6 +4239,7 @@ function PluginPanelInner() {
                           lang: cjkLang,
                           only_with_prefix: true,
                           font_size: cjkFontSize,
+                          overwrite_lang: cjkOverwrite,
                         })
                       );
                       setCjkStatus(r?.message || '完成');
@@ -4167,6 +4258,123 @@ function PluginPanelInner() {
           cjkRepairing ? '修复中…' : '仅修复已有 Proton 前缀的'
         )
       ),
+      React.createElement(
+        PanelSectionRow,
+        { key: 'nsc-cjk-overwrite' },
+        React.createElement(
+          'button',
+          {
+            onClick: () => setCjkOverwrite((v) => !v),
+            style: {
+              width: '100%',
+              padding: '8px 10px',
+              borderRadius: 4,
+              border: cjkOverwrite ? '1px solid #1a9fff' : '1px solid #456',
+              background: cjkOverwrite ? '#1a9fff' : '#1b2838',
+              color: '#fff',
+              fontSize: 13,
+              textAlign: 'left',
+            },
+          },
+          (cjkOverwrite ? '☑ ' : '☐ ') + '覆盖已设语言'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        { key: 'nsc-cjk-overwrite-hint' },
+        React.createElement(
+          'div',
+          { style: { fontSize: 11, opacity: 0.75, lineHeight: 1.45, marginBottom: 6 } },
+          '不勾选时，已经设过别的语言的游戏会被跳过（防止批量操作覆盖你逐个调好的设置）。选错语言想全部改过来时必须勾上。'
+        )
+      ),
+      React.createElement(
+        PanelSectionRow,
+        { key: 'nsc-cjk-scan-all' },
+        React.createElement(
+          'button',
+          {
+            disabled: cjkScanning,
+            onClick: () => {
+              void (async () => {
+                setCjkScanning(true);
+                try {
+                  const r = unwrapResult(await detectCjkLang({}));
+                  // 路径过不了代码页的必须永远显示 —— 那是最需要处理的一类，
+                  // 不能因为「把握低」被一起藏掉。
+                  const rows = (r?.results || []).filter(
+                    (x: any) =>
+                      x &&
+                      x.ok &&
+                      (x.hard_evidence ||
+                        x.confidence !== '低' ||
+                        (x.path_check && !x.path_check.ok))
+                  );
+                  setCjkScan(rows);
+                  setCjkStatus(r?.message || '');
+                } catch (e) {
+                  setCjkStatus('检测失败：' + String(e));
+                } finally {
+                  setCjkScanning(false);
+                }
+              })();
+            },
+            style: {
+              width: '100%',
+              padding: '10px',
+              borderRadius: 4,
+              border: '1px solid #456',
+              background: '#1b2838',
+              color: '#fff',
+              fontSize: 13,
+            },
+          },
+          cjkScanning ? '检测中…' : '自动检测全部游戏该用哪个语言（只读，不改动）'
+        )
+      ),
+      cjkScan && cjkScan.length
+        ? React.createElement(
+            PanelSectionRow,
+            { key: 'nsc-cjk-scan-out' },
+            React.createElement(
+              'div',
+              { style: { fontSize: 11, lineHeight: 1.5, maxHeight: 300, overflowY: 'auto' } },
+              ...cjkScan.map((x: any, i: number) =>
+                React.createElement(
+                  'div',
+                  {
+                    key: 'cs' + i,
+                    style: {
+                      padding: '4px 6px',
+                      marginBottom: 3,
+                      borderRadius: 3,
+                      background: '#0e1620',
+                      borderLeft:
+                        x.path_check && !x.path_check.ok
+                          ? '3px solid #d66'
+                          : x.hard_evidence
+                          ? '3px solid #5b5'
+                          : '3px solid #567',
+                    },
+                  },
+                  React.createElement('div', null, x.name || x.dir),
+                  React.createElement(
+                    'div',
+                    { style: { color: '#9cf' } },
+                    `${x.lang_label || x.lang}（把握 ${x.confidence}${x.hard_evidence ? '，有硬证据' : ''}）`
+                  ),
+                  x.path_check && !x.path_check.ok
+                    ? React.createElement(
+                        'div',
+                        { style: { color: '#f88' } },
+                        '⚠ ' + x.path_check.message
+                      )
+                    : null
+                )
+              )
+            )
+          )
+        : null,
       cjkStatus
         ? React.createElement(
             PanelSectionRow,

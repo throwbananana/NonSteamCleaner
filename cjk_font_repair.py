@@ -2396,6 +2396,7 @@ def repair_cjk_fonts_batch(
     lang: str = "zh_CN",
     only_with_prefix: bool = False,
     font_size: Any = 0,
+    overwrite_lang: bool = False,
     games: Optional[List[Dict[str, Any]]] = None,
     collect_prefix_dirs,
     find_steam_root,
@@ -2403,7 +2404,12 @@ def repair_cjk_fonts_batch(
     read_node,
     write_vdf,
 ) -> Dict[str, Any]:
-    """批量修复。appids 为空则处理传入的 games 列表。"""
+    """批量修复。appids 为空则处理传入的 games 列表。
+
+    overwrite_lang 默认 False：已经设过**别的**语言的游戏会被保留，避免批量操作
+    覆盖用户逐个调好的设置。但选错语言后想全部改过来时必须传 True —— 否则这些
+    游戏会被静默跳过，而且仍然计入「已处理」，看起来成功了其实一条都没改。
+    """
     preset = resolve_cjk_preset(lang)
     if games is None:
         games = []
@@ -2430,7 +2436,7 @@ def repair_cjk_fonts_batch(
                 key=str(g.get("key") if g.get("key") is not None else ""),
                 name=str(g.get("name") or ""),
                 lang=preset["key"],
-                overwrite_lang=False,
+                overwrite_lang=overwrite_lang,
                 start_dir=str(g.get("start_dir") or ""),
                 exe=str(g.get("exe") or ""),
                 font_size=font_size,
@@ -2446,17 +2452,422 @@ def repair_cjk_fonts_batch(
             skipped.append({"appid": aid, "name": g.get("name"), "reason": str(e)})
 
     ok_n = sum(1 for f in fixed if f.get("success"))
+    # 启动项因为「已经是另一种语言」而没改的，必须单独报出来。
+    # 它们的 success 仍是 True（前缀该修的都修了），只统计成功数会让人以为
+    # 语言已经换过去了，实际上一条启动项都没动。
+    kept_lang: List[Dict[str, Any]] = []
+    for f in fixed:
+        for d in (f.get("launch") or {}).get("details") or []:
+            if d.get("skipped") == "other_lang":
+                kept_lang.append(
+                    {
+                        "appid": d.get("appid"),
+                        "name": d.get("name"),
+                        "launch_options": d.get("launch_options"),
+                    }
+                )
+
     return {
         "success": True,
         "lang": preset["key"],
         "lang_label": preset["label"],
         "fixed_count": ok_n,
         "skipped_count": len(skipped),
+        "kept_other_lang_count": len(kept_lang),
+        "kept_other_lang": kept_lang[:40],
         "fixed": fixed[:80],
         "skipped": skipped[:40],
         "message": (
             f"已按「{preset['label']}」处理 {ok_n} 个非 Steam 游戏"
             + (f"，跳过 {len(skipped)} 个" if skipped else "")
+            + (
+                f"；其中 {len(kept_lang)} 个已设过别的语言，启动项保持原样未改"
+                "（要改成当前语言请用「覆盖已设语言」）"
+                if kept_lang
+                else ""
+            )
             + "。请完全退出 Steam 再启动对应游戏。"
         ),
     }
+
+
+# ===========================================================================
+# 自动检测该用哪个 CJK 预设
+# ---------------------------------------------------------------------------
+# 老的日文 / 汉化 Windows 游戏都是 ANSI 程序：它读自己的路径、配置文件、
+# 数据文件名时，都要过一遍系统 ANSI 代码页。代码页选错的后果分两级：
+#   轻 —— 文字显示成 ?? 或乱码；
+#   重 —— 找不到自己的数据文件、建不出存档目录，启动即弹框退出。
+# 后一种最难查，因为游戏什么日志都不留，界面上只有一个没头没尾的错误框。
+#
+# 判据按可信度排序：
+#   1. 硬证据：引擎配置里写的数据文件名，用哪个代码页解码才对得上磁盘上真实
+#      存在的文件。对不上游戏就读不到自己的数据，这是唯一解，一票定音。
+#   2. 数据文件名的性质：是「真文本」还是「某代码页的乱码」。
+#   3. 配置里的 GameName —— 它决定存档目录名。
+#   4. 汉化组的 CN / CHS 人为标记。
+#   5. 随包说明文档、字体、文件名整体倾向（弱证据，兜底用）。
+# ===========================================================================
+
+CJK_CONFIG_FILES = ("AliceStart.ini", "alicestart.ini", "System40.ini", "System39.ini")
+CJK_DATA_EXTS = (".ain", ".ald", ".afa", ".alk", ".wai", ".bgi")
+
+# 常用字表：用来区分「真中文」和「字都合法但根本没人这么写」的误读产物。
+# 例如 GBK 的「兰斯9」被 Big5 读成「擘佴9」，两个字都是合法汉字，
+# 但没有一个常用字，命中率立刻把这种误读打下去。
+_CJK_COMMON_SC = frozenset(
+    "的一是了我不人在他有这个上们来到时大地为子中你说生国年着就那和要"
+    "出也得里后自以会家可下而过天去能对小多然于心学么之都好看起发当没"
+    "成只如事把还用第样道想作种开美总从无情己面最女但现前些所同日手又"
+    "行意动方期它头经长儿回位分爱老因很给名法间斯知世什两次使身者被高"
+    "已亲其进此话常与活正感汉化组版中文简体游戏兰斯完全修改编辑刻碟贩售"
+)
+_CJK_COMMON_TC = frozenset(
+    "的一是了我不人在他有這個上們來到時大地為子中你說生國年著就那和要"
+    "出也得裡後自以會家可下而過天去能對小多然於心學麼之都好看起發當沒"
+    "成只如事把還用第樣道想作種開美總從無情己面最女但現前些所同日手又"
+    "行意動方期它頭經長兒回位分愛老因很給名法間斯知世什兩次使身者被高"
+    "已親其進此話常與活正感漢化組版中文簡體遊戲蘭斯完全修改編輯刻碟販售"
+)
+
+
+def cjk_codepage_for_lang(lang: str) -> str:
+    """预设 -> Python 编解码器名。"""
+    preset = resolve_cjk_preset(lang)
+    return "cp" + str(preset.get("acp") or "936")
+
+
+def cjk_text_quality(s: str) -> float:
+    """0~1，越高越像人写的正常文本。
+
+    乱码最稳定的特征是半角片假名（UTF/GBK 文本被当成 Shift-JIS 读的产物）
+    和私用区字符，所以这两类直接重罚。
+    """
+    if not s:
+        return 0.0
+    good = bad = 0
+    for c in s:
+        o = ord(c)
+        if 0xFF61 <= o <= 0xFF9F:
+            bad += 2
+        elif 0xE000 <= o <= 0xF8FF:
+            bad += 3
+        elif c == "�":
+            bad += 3
+        elif o < 0x80:
+            good += 1
+        elif 0x3040 <= o <= 0x30FF:
+            good += 2
+        elif 0x4E00 <= o <= 0x9FFF:
+            good += 1
+        elif 0x3000 <= o <= 0x303F or 0xFF00 <= o <= 0xFF60:
+            good += 1
+        else:
+            bad += 1
+    total = good + bad
+    return good / total if total else 0.0
+
+
+def _cjk_script_hint(s: str) -> tuple:
+    """返回 (常用简体命中数, 常用繁体命中数, 假名数)。"""
+    sc = sum(1 for c in s if c in _CJK_COMMON_SC)
+    tc = sum(1 for c in s if c in _CJK_COMMON_TC)
+    kana = sum(1 for c in s if 0x3040 <= ord(c) <= 0x30FF)
+    return sc, tc, kana
+
+
+def cjk_score_text_for_lang(s: str, lang: str) -> float:
+    """一段文本按某语言解出来之后有多可信。质量分 + 常用字命中率。"""
+    q = cjk_text_quality(s)
+    sc, tc, kana = _cjk_script_hint(s)
+    n = max(len(s), 1)
+    if lang == "zh_CN":
+        return q + 2.0 * sc / n
+    if lang == "zh_TW":
+        return q + 2.0 * tc / n
+    return q + 2.0 * kana / n
+
+
+def _cjk_decode(data: bytes, cp: str) -> Optional[str]:
+    try:
+        return data.decode(cp)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cjk_read_config(game_dir: str) -> tuple:
+    for name in CJK_CONFIG_FILES:
+        p = os.path.join(game_dir, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "rb") as fp:
+                return name, fp.read()
+        except OSError:
+            continue
+    return None, None
+
+
+def _cjk_ini_value(raw: bytes, key: bytes) -> Optional[bytes]:
+    # 行尾用 (?=[\r\n]|\Z) 而不是吃掉一个换行符，否则文件最后一行没有换行时读不到。
+    for k, v in re.findall(rb"^[ \t]*(\w+)[ \t]*=[ \t]*(.*?)(?=[\r\n]|\Z)", raw, re.M):
+        if k.lower() == key:
+            return v.strip().strip(b'"')
+    return None
+
+
+def classify_cjk_filename(name: str) -> tuple:
+    """一个非 ASCII 文件名是「真文本」还是「乱码」。
+
+    儔儞僗俇偦偺屻.ain  -> Shift-JIS 字节被 GBK 解读出来的，游戏必须跑在 GBK 下
+    三匹が.ain          -> 本身就是正常日文名，游戏必须跑在 Shift-JIS 下
+    """
+    q_asis = cjk_text_quality(name)
+    try:
+        reinterp = name.encode("cp936").decode("cp932")
+    except Exception:  # noqa: BLE001
+        reinterp = None
+    q_re = cjk_text_quality(reinterp) if reinterp else 0.0
+    if reinterp and q_re > q_asis + 0.25:
+        return "needs_gbk", "%s 按 GBK 还原成「%s」才是正常日文" % (name, reinterp)
+    if q_asis > 0.7 and any(0x3040 <= ord(c) <= 0x30FF for c in name):
+        return "native_jp", "%s 本身就是正常日文名" % name
+    return "neutral", ""
+
+
+def check_path_codepage(path: str, lang: str) -> Dict[str, Any]:
+    """游戏路径能否被该预设的 ANSI 代码页表示。
+
+    表示不了就是死局：游戏连自己的目录都找不到，装什么字体都没用，
+    只能把路径改成该代码页能表示的字符（最保险是纯 ASCII）。
+    """
+    cp = cjk_codepage_for_lang(lang)
+    bad = []
+    for c in set(path or ""):
+        if c in "/\\ ":
+            continue
+        try:
+            c.encode(cp)
+        except Exception:  # noqa: BLE001
+            bad.append(c)
+    bad.sort()
+    return {
+        "ok": not bad,
+        "path": path,
+        "codepage": cp,
+        "bad_chars": "".join(bad),
+        "message": (
+            ""
+            if not bad
+            else "路径含「%s」，%s 代码页无法表示。游戏会找不到自己的目录，"
+            "请先把路径改成英文（纯 ASCII 最保险）再修复。" % ("".join(bad), cp)
+        ),
+    }
+
+
+def _cjk_hint_cn_marker(game_dir, names, scores, reasons) -> None:
+    """汉化组习惯把改过的可执行文件/数据标上 CN / CHS，这是很硬的人为标记。"""
+    for n in names:
+        stem, ext = os.path.splitext(n)
+        if ext.lower() not in (".exe", ".ain"):
+            continue
+        up = stem.upper()
+        if up.endswith("CN") or "CHS" in up or up.endswith("_SC"):
+            scores["zh_CN"] += 20
+            reasons.append("[汉化标记] %s 带 CN/CHS 标记，是汉化组改过的版本 -> GBK" % n)
+            return
+
+
+def _cjk_hint_aux(game_dir, names, scores, reasons) -> None:
+    """随包字体和说明文档。
+
+    说明书是弱证据 —— 汉化版经常原封不动保留日文原版的 readme，
+    权重必须压在游戏名之下，否则会把汉化版误判成日文版。
+    """
+    for n in names:
+        low = n.lower()
+        if low.endswith((".ttf", ".otf", ".ttc")) and any(
+            k in low for k in ("simhei", "cn", "sc", "hei", "song", "kai", "yahei")
+        ):
+            scores["zh_CN"] += 15
+            reasons.append("[随包字体] %s 是中文字体，说明是简中汉化版 -> GBK" % n)
+            break
+    best = None
+    for n in names:
+        if not n.lower().endswith((".txt", ".md")):
+            continue
+        try:
+            with open(os.path.join(game_dir, n), "rb") as fp:
+                raw = fp.read(4000)
+        except OSError:
+            continue
+        if raw.isascii():
+            continue
+        for lang in CJK_LANG_PRESETS:
+            t = _cjk_decode(raw, cjk_codepage_for_lang(lang))
+            if t is None:
+                continue
+            s = cjk_score_text_for_lang(t, lang)
+            if best is None or s > best[0]:
+                best = (s, lang, n)
+    if best and best[0] > 0.9:
+        scores[best[1]] += 6
+        reasons.append(
+            "[说明文档] %s 按%s解码最通顺（弱证据）"
+            % (best[2], CJK_LANG_PRESETS[best[1]]["label"])
+        )
+
+
+def _cjk_hint_filenames(names, scores, reasons) -> None:
+    """目录里非 ASCII 文件名整体偏简中还是偏日文。兜底用。"""
+    blob = "".join(n for n in names if not n.isascii())
+    if not blob:
+        return
+    sc, _tc, kana = _cjk_script_hint(blob)
+    if sc >= 3 and sc > kana:
+        scores["zh_CN"] += 8
+        reasons.append("[文件名] 目录内文件名多为简体中文（命中常用字 %d 处）" % sc)
+    elif kana >= 3 and kana > sc:
+        scores["ja_JP"] += 8
+        reasons.append("[文件名] 目录内文件名多为日文假名（%d 处）" % kana)
+
+
+def detect_cjk_lang_for_dir(game_dir: str, exe: str = "") -> Dict[str, Any]:
+    """检测某个游戏目录该用哪个 CJK 预设。
+
+    exe 是实际会被启动的可执行文件。它很重要：同一个目录里常常既有原版
+    System40.exe 又有汉化版 System40CN.exe，而配置文件 System40.ini 里的
+    CodeName 记的往往是**原版**的数据文件名。这时候如果只看 ini，会把汉化版
+    误判成日文版 —— 所以带 CN/CHS 标记的启动 exe 的权重要压过 ini 的硬证据。
+    """
+    result: Dict[str, Any] = {
+        "ok": False,
+        "dir": game_dir,
+        "exe": exe,
+        "lang": "zh_CN",
+        "confidence": "低",
+        "scores": {},
+        "reasons": [],
+        "config": "",
+        "hard_evidence": False,
+    }
+    if not game_dir or not os.path.isdir(game_dir):
+        result["reasons"].append("目录不存在，无法检测")
+        return result
+
+    langs = list(CJK_LANG_PRESETS)
+    scores = {l: 0 for l in langs}
+    reasons: List[str] = []
+    try:
+        names = os.listdir(game_dir)
+    except OSError as exc:
+        result["reasons"].append("读取目录失败：%s" % exc)
+        return result
+
+    cfg_name, raw = _cjk_read_config(game_dir)
+    hard = False
+
+    # 判据 0：实际启动的 exe 自带汉化标记 —— 比 ini 更可信，因为 ini 描述的
+    # 常常是同目录下那个没被汉化的原版 exe。
+    exe_stem = os.path.splitext(os.path.basename((exe or "").strip('"')))[0].upper()
+    exe_is_cn = bool(exe_stem) and (
+        exe_stem.endswith("CN") or "CHS" in exe_stem or exe_stem.endswith("_SC")
+    )
+    if exe_is_cn:
+        scores["zh_CN"] += 120
+        hard = True
+        reasons.append(
+            "[启动项] 实际启动的是 %s，带 CN/CHS 汉化标记 -> GBK"
+            "（同目录 ini 里记的多半是原版日文 exe 的信息，不作数）"
+            % os.path.basename(exe)
+        )
+
+    # 判据 1：数据文件名必须对得上磁盘（硬证据）
+    # exe 已经自报汉化身份时跳过：此时 ini 描述的是同目录那个原版 exe，
+    # 让它参与只会把结论拉回日文。
+    if raw and not exe_is_cn:
+        code = _cjk_ini_value(raw, b"codename")
+        if code and not code.isascii():
+            for lang in langs:
+                name = _cjk_decode(code, cjk_codepage_for_lang(lang))
+                if name and os.path.isfile(os.path.join(game_dir, name)):
+                    scores[lang] += 100
+                    hard = True
+                    reasons.append(
+                        "[硬证据] %s 里的数据文件名按%s解码 = %s，磁盘上确实有这个文件"
+                        % (cfg_name, CJK_LANG_PRESETS[lang]["label"], name)
+                    )
+            if not hard:
+                reasons.append("[警告] %s 里的数据文件名在任何代码页下都对不上磁盘文件" % cfg_name)
+        elif code:
+            reasons.append("%s 的数据文件名 %s 是 ASCII，不构成约束" % (cfg_name, code.decode()))
+
+    # 判据 2：数据文件名的性质（有硬证据时不再参与，避免自相矛盾）
+    if not hard:
+        seen: Dict[str, str] = {}
+        for n in names:
+            if n.isascii() or not n.lower().endswith(CJK_DATA_EXTS):
+                continue
+            verdict, why = classify_cjk_filename(n)
+            if verdict != "neutral" and verdict not in seen:
+                seen[verdict] = why
+        if "needs_gbk" in seen:
+            scores["zh_CN"] += 40
+            reasons.append("[数据文件] %s -> 必须 GBK" % seen["needs_gbk"])
+        if "native_jp" in seen:
+            scores["ja_JP"] += 40
+            reasons.append("[数据文件] %s -> 必须 Shift-JIS" % seen["native_jp"])
+
+    # 判据 3：GameName 决定存档目录名
+    if raw:
+        title = _cjk_ini_value(raw, b"gamename")
+        if title and not title.isascii():
+            cand = []
+            for lang in langs:
+                t = _cjk_decode(title, cjk_codepage_for_lang(lang))
+                if t is not None:
+                    cand.append((cjk_score_text_for_lang(t, lang), lang, t))
+            cand.sort(key=lambda x: x[0], reverse=True)
+            if cand:
+                s, lang, t = cand[0]
+                scores[lang] += 10
+                reasons.append(
+                    "[游戏名] 按%s解码最通顺(%.2f) = %s"
+                    % (CJK_LANG_PRESETS[lang]["label"], s, t[:30])
+                )
+
+    # 判据 4/5：硬证据缺席时的兜底
+    if not hard:
+        _cjk_hint_cn_marker(game_dir, names, scores, reasons)
+        _cjk_hint_aux(game_dir, names, scores, reasons)
+        _cjk_hint_filenames(names, scores, reasons)
+
+    best = max(scores, key=lambda l: scores[l])
+    top = scores[best]
+    second = max([v for k, v in scores.items() if k != best] or [0])
+    if top == 0:
+        confidence = "低"
+    elif hard or top - second >= 25:
+        confidence = "高"
+    elif top - second >= 10:
+        confidence = "中"
+    else:
+        confidence = "低"
+
+    lang = best if top else "zh_CN"
+    result.update(
+        {
+            "ok": True,
+            "lang": lang,
+            "lang_label": CJK_LANG_PRESETS[lang]["label"],
+            "confidence": confidence,
+            "scores": scores,
+            "reasons": reasons,
+            "config": cfg_name or "",
+            "hard_evidence": hard,
+            "path_check": check_path_codepage(game_dir, lang),
+        }
+    )
+    if top == 0:
+        result["reasons"].append("没找到任何有效线索，回退到默认的简体中文；建议两个预设都试一次")
+    return result

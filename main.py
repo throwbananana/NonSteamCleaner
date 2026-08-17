@@ -81,6 +81,8 @@ CJK_FONT_SIZE_OPTIONS = getattr(_cjk, "CJK_FONT_SIZE_OPTIONS", [])
 repair_cjk_fonts_batch = _cjk.repair_cjk_fonts_batch
 repair_cjk_fonts_for_game = _cjk.repair_cjk_fonts_for_game
 resolve_cjk_preset = _cjk.resolve_cjk_preset
+detect_cjk_lang_for_dir = _cjk.detect_cjk_lang_for_dir
+check_path_codepage = _cjk.check_path_codepage
 
 STEAM_ROOTS = [
     os.path.expanduser("~/.steam/steam"),
@@ -5335,6 +5337,56 @@ class Plugin:
             "default_font_size": 24,
         }
 
+    async def detect_cjk_lang(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """检测游戏该用哪个 CJK 预设，不做任何修改。
+
+        参数：
+          - appid: 指定单个；为空则检测全部非 Steam 游戏
+          - start_dir: 直接指定目录（优先于 appid）
+        """
+        if isinstance(_arg, dict):
+            kwargs = {**_arg, **kwargs}
+        cjk = _load_cjk_font_repair()
+        appid = kwargs.get("appid")
+        start_dir = str(kwargs.get("start_dir") or "")
+
+        if start_dir:
+            return {
+                "success": True,
+                "results": [
+                    cjk.detect_cjk_lang_for_dir(start_dir, str(kwargs.get("exe") or ""))
+                ],
+            }
+
+        games = await self.get_non_steam_games()
+        if appid is not None and appid != "":
+            want = normalize_appid(appid)
+            games = [g for g in games if normalize_appid(g.get("appid")) == want]
+            if not games:
+                return {"success": False, "message": "找不到该游戏", "results": []}
+
+        results: List[Dict[str, Any]] = []
+        for g in games:
+            game_exe = str(g.get("exe") or "").strip('"')
+            game_dir = str(g.get("start_dir") or "")
+            if not game_dir:
+                game_dir = os.path.dirname(game_exe) if game_exe else ""
+            det = cjk.detect_cjk_lang_for_dir(game_dir.rstrip("/"), game_exe)
+            det["appid"] = normalize_appid(g.get("appid"))
+            det["name"] = str(g.get("name") or "")
+            results.append(det)
+
+        hard = sum(1 for r in results if r.get("hard_evidence"))
+        blocked = [r for r in results if not (r.get("path_check") or {}).get("ok", True)]
+        return {
+            "success": True,
+            "results": results,
+            "message": (
+                "检测 %d 个游戏，其中 %d 个有硬证据" % (len(results), hard)
+                + ("；%d 个路径含该代码页无法表示的字符，需先改路径" % len(blocked) if blocked else "")
+            ),
+        }
+
     async def repair_cjk_fonts(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
         """修复汉化字体（批量或单个）。
 
@@ -5370,7 +5422,21 @@ class Plugin:
                         if not key:
                             key = str(g.get("key") if g.get("key") is not None else "")
                         break
-            return repair_cjk_fonts_for_game(
+            # 路径必须能被目标代码页表示，否则修完游戏反而连自己的目录都找不到：
+            # 游戏是 ANSI 程序，路径要过一遍 ANSI 代码页，表示不了的字符会变成 '?'。
+            # 这种情况装什么字体都没用，必须先改路径，所以直接拒绝而不是照做。
+            path_check = check_path_codepage(start_dir or exe.strip('"'), lang)
+            if not path_check["ok"]:
+                return {
+                    "success": False,
+                    "appid": normalize_appid(appid),
+                    "name": name,
+                    "lang": lang,
+                    "path_check": path_check,
+                    "changed": False,
+                    "message": "未修改：" + path_check["message"],
+                }
+            result = repair_cjk_fonts_for_game(
                 appid=appid,
                 userdata_id=userdata_id,
                 key=key,
@@ -5385,6 +5451,9 @@ class Plugin:
                 read_node=_read_node,
                 write_vdf=write_vdf,
             )
+            if isinstance(result, dict):
+                result["path_check"] = path_check
+            return result
 
         games = await self.get_non_steam_games()
         id_list = None
@@ -5396,18 +5465,54 @@ class Plugin:
         elif appid is not None and appid != "":
             id_list = [appid]
 
-        return repair_cjk_fonts_batch(
+        # 同上：路径过不了目标代码页的游戏一律不动，单独列出来让用户先改路径。
+        # 只统计本次真正会处理的游戏 —— 指定了 appids 时，把全库其它游戏的
+        # 路径问题也报出来只会制造噪音（它们根本不在这次操作范围内）。
+        want_ids = (
+            {normalize_appid(a) for a in id_list if normalize_appid(a)}
+            if id_list
+            else None
+        )
+        blocked: List[Dict[str, Any]] = []
+        usable: List[Dict[str, Any]] = []
+        for g in games:
+            if want_ids is not None and normalize_appid(g.get("appid")) not in want_ids:
+                usable.append(g)  # 不在本次范围内，交给下游按 appids 过滤
+                continue
+            probe = str(g.get("start_dir") or "") or str(g.get("exe") or "").strip('"')
+            check = check_path_codepage(probe, lang)
+            if check["ok"]:
+                usable.append(g)
+            else:
+                blocked.append(
+                    {
+                        "appid": normalize_appid(g.get("appid")),
+                        "name": str(g.get("name") or ""),
+                        "path": probe,
+                        "bad_chars": check["bad_chars"],
+                    }
+                )
+
+        result = repair_cjk_fonts_batch(
             appids=id_list,
             lang=lang,
             only_with_prefix=only_with_prefix,
             font_size=font_size,
-            games=games,
+            overwrite_lang=bool(kwargs.get("overwrite_lang", False)),
+            games=usable,
             collect_prefix_dirs=_collect_prefix_dirs,
             find_steam_root=find_steam_root,
             normalize_appid=normalize_appid,
             read_node=_read_node,
             write_vdf=write_vdf,
         )
+        if isinstance(result, dict) and blocked:
+            result["blocked_by_path"] = blocked
+            result["message"] = str(result.get("message") or "") + (
+                "；另有 %d 个游戏的路径含 %s 代码页无法表示的字符，已跳过，"
+                "请先把这些游戏的目录改成英文" % (len(blocked), resolve_cjk_preset(lang).get("acp"))
+            )
+        return result
 
     async def repair_nonsteam_icons(self, _arg: Any = None, **kwargs: Any) -> Dict[str, Any]:
         """为已在库中的非 Steam 游戏补写 grid 图标（从 exe/旁路图标提取）。"""
