@@ -22,7 +22,7 @@ npm run watch       # rollup -c -w
 
 There is no lint or test script configured — `package.json` only defines `build`/`watch`. TypeScript is checked as part of the rollup build (`@rollup/plugin-typescript`, `noEmitOnError: false`, so type errors do **not** fail the build — check `tsc --noEmit` manually if you need a hard type-check).
 
-There is no Python test suite. Backend correctness has to be reasoned about by reading `main.py`/`cjk_font_repair.py` directly, since it depends on live Steam/Deck filesystem state.
+There is no Python test *framework*, and most backend logic can only be checked by reading `main.py`/`cjk_font_repair.py` directly, since it depends on live Steam/Deck filesystem state. The exception is `tests/test_launch_options.py` — a dependency-free script (`python3 tests/test_launch_options.py`, exits non-zero on failure) covering `build_cjk_launch_options`, whose pure-string logic is both testable and easy to break silently. Run it after touching that function. It is excluded from the release tarball.
 
 ### Deploying to a Deck
 
@@ -66,6 +66,8 @@ Every backend RPC method is exposed by adding an `async def` to `class Plugin`, 
     - **Hard evidence**: decode the config's `CodeName` under each candidate codepage and check which result names a file that actually exists on disk. Only one can be right, because the game literally cannot open the others.
     - Filename nature via `classify_cjk_filename`: `三匹が.ain` is genuine Japanese (needs Shift-JIS); `儔儞僗俇偦偺屻.ain` is Shift-JIS bytes that were decoded as GBK when the archive was extracted (needs GBK, *not* Shift-JIS — a natural but wrong assumption). Distinguishing them needs `cjk_text_quality`, since both "decode successfully" under either codepage.
     - `GameName` (determines the save-folder name), then weak fallbacks (bundled fonts, readme, filename script).
+
+    `build_cjk_launch_options` must preserve the **position** of `%command%`. In a Steam launch-option string, tokens before `%command%` are environment/wrapper and tokens after it are arguments passed to the game. An earlier version stripped `%command%` and re-appended it at the end, which silently converted `~/lsfg %command% -f rom.gba` into `~/lsfg -f rom.gba %command%` — the ROM path then went to the wrapper instead of the emulator, so the game launched but loaded nothing, with no error anywhere. Only prepend `LANG=`/`LC_ALL=`; never reorder the rest. `tests/test_launch_options.py` locks this in.
 
     `cjk_text_quality` plus the `_CJK_COMMON_SC`/`_CJK_COMMON_TC` common-character sets exist because "decodes without raising" is nearly meaningless across CJK codepages — GBK bytes read as Big5 yield perfectly valid but nonsensical ideographs (`兰斯9` → `擘佴9`). Scoring by half-width-katakana/PUA penalties and common-character hit rate is what separates real text from plausible garbage.
 10. **`class Plugin`** (bottom of `main.py`) — thin async wrappers around the above, one per RPC method; this is the only part directly reachable from the frontend, so business logic changes almost always belong in the free functions above it, not inline in a `Plugin` method.

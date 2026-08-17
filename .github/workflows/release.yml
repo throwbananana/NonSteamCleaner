@@ -47,7 +47,7 @@ jobs:
           PKG="${NAME}.tar.gz"
           # 写入 RUNNER_TEMP 再拷回工作区，避免 tar 读取自身输出导致 "file changed"
           # 顶层包成 <name>/ 目录，并排除 .git/.github/node_modules
-          tar -czf "$RUNNER_TEMP/$PKG" --exclude=.git --exclude=.github --exclude=node_modules \
+          tar -czf "$RUNNER_TEMP/$PKG" --exclude=.git --exclude=.github --exclude=node_modules --exclude=tests \
             --transform "s,^\.,$NAME," -C "$DIR" .
           cp "$RUNNER_TEMP/$PKG" "$PKG"
           echo "pkg=$PKG" >> "$GITHUB_OUTPUT"

@@ -127,22 +127,35 @@ def default_common_font_aliases(preset: Dict[str, str]) -> List[Dict[str, str]]:
 
 
 def build_cjk_launch_options(existing: str, unix_lang: str) -> str:
-    """合并/写入 LANG/LC_ALL 启动项，保留用户其它参数。"""
+    """合并/写入 LANG/LC_ALL 启动项，其余部分**保持原有顺序**。
+
+    Steam 启动项里 `%command%` 是游戏本体的占位符，它的位置有语义：
+    前面的是环境变量和包装器，后面的是传给**游戏**的参数。
+
+        ~/lsfg %command% -f rom.gba     -f rom.gba 传给游戏 ✓
+        ~/lsfg -f rom.gba %command%     -f rom.gba 传给了 ~/lsfg ✗
+
+    所以绝不能把 %command% 抽出来重新拼到末尾 —— 那会让模拟器类快捷方式
+    （传 ROM 路径、光盘镜像、-locale 等）静默失效：游戏照样启动，但收不到
+    任何参数，表现为「突然不加载 ROM 了」，且没有任何报错。
+    """
     existing = (existing or "").strip()
-    parts = existing.split()
     kept: List[str] = []
-    for p in parts:
+    for p in existing.split():
         up = p.upper()
-        if up.startswith("LANG=") or up.startswith("LC_ALL=") or up.startswith("HOST_LC_ALL="):
-            continue
-        if p == "%command%":
+        if up.startswith(("LANG=", "LC_ALL=", "HOST_LC_ALL=")):
             continue
         kept.append(p)
+
     prefix = f"LANG={unix_lang} LC_ALL={unix_lang}"
-    rest = " ".join(kept).strip()
-    if rest:
-        return f"{prefix} {rest} %command%"
-    return f"{prefix} %command%"
+    if not kept:
+        return f"{prefix} %command%"
+    if "%command%" not in kept:
+        # 原本没有 %command% 时，Steam 把整串当成追加给游戏的参数。
+        # 环境变量必须位于命令之前，所以补一个 %command% 把两者分开，
+        # 否则 LANG=... 会被当作游戏的第一个参数传进去。
+        return f"{prefix} %command% " + " ".join(kept)
+    return f"{prefix} " + " ".join(kept)
 
 
 def _set_reg_value_line(section: str, key: str, value: str) -> str:
