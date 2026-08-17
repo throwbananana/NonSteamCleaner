@@ -464,6 +464,73 @@ def _pick_cjk_ttf_source() -> str:
     return _fc_match_cjk_font()
 
 
+def _pick_cjk_mono_ttf_source() -> str:
+    """挑一个**等宽** CJK 字体作源。
+
+    为什么不能一律用 msyh：老的日文/汉化游戏按「CJK=全角、ASCII=半角」的固定
+    像素宽度排版。微软雅黑和 Noto Sans CJK 都是比例字体，拉丁字符宽度不固定，
+    拿它冒充 SimSun / MS Gothic 这类等宽家族，引擎算出来的坐标和实际绘制宽度
+    对不上，文字就会重叠、出框、显示不全 —— 字能显示，但排版是坏的。
+
+    Proton 自带的 simsun.ttc 正是为此存在（提供 SimSun/宋体/NSimSun/新宋体），
+    优先用它。
+    """
+    home = os.path.expanduser("~")
+    roots = [
+        os.path.join(home, ".local/share/Steam/steamapps/common"),
+        os.path.join(home, ".steam/steam/steamapps/common"),
+    ]
+    names = ("simsun.ttc", "msgothic.ttc")
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            protons = sorted(n for n in os.listdir(root) if "roton" in n)
+        except Exception:  # noqa: BLE001
+            continue
+        for pn in protons:
+            for fn in names:
+                p = os.path.join(root, pn, "files/share/fonts", fn)
+                if os.path.isfile(p):
+                    return p
+    return ""
+
+
+# Proton 自带这两个 ttc，它们提供的家族是**正确的等宽字体**，
+# 克隆一份同名的比例字体注册上去只会把它们盖掉，纯属劣化。
+_PROTON_PROVIDED_FAMILIES = {
+    "simsun.ttc": ("SimSun", "宋体", "NSimSun", "新宋体"),
+    "msgothic.ttc": (
+        "MS Gothic", "ＭＳ ゴシック",
+        "MS PGothic", "ＭＳ Ｐゴシック",
+        "MS UI Gothic",
+    ),
+}
+
+# 这些家族本身是等宽的，做替身时必须用等宽源。
+# 其余（雅黑、Meiryo、各种 Ｐ 开头的）本来就是比例字体，用 msyh 才对。
+_MONO_FAMILIES = frozenset(
+    {
+        "SimSun", "宋体", "NSimSun", "新宋体",
+        "SimHei", "黑体",
+        "KaiTi", "楷体", "FangSong", "仿宋", "MINGLAN",
+        "MS Gothic", "ＭＳ ゴシック", "MS UI Gothic",
+        "MS Mincho", "ＭＳ 明朝",
+        "MingLiU", "細明體",
+    }
+)
+
+
+def _families_provided_by_prefix(fonts_dir: str) -> set:
+    """前缀里已经由 Proton 正确提供的家族名集合。"""
+    out = set()
+    for fn, fams in _PROTON_PROVIDED_FAMILIES.items():
+        p = os.path.join(fonts_dir, fn)
+        if os.path.exists(p):  # 通常是指向 Proton 字体目录的符号链接
+            out.update(fams)
+    return out
+
+
 def _fc_match_cjk_font() -> str:
     """用 fc-match 查系统已安装的 CJK 字体文件路径，作为写死路径找不到时的通用兜底。"""
     import shutil as _shutil
@@ -2067,6 +2134,9 @@ def ensure_simhei_font_links(fonts_dir: str, extra_families: Optional[List[Any]]
             continue
         if fam:
             named.append((fn, fam))
+    mono_src = _pick_cjk_mono_ttf_source()
+    provided = _families_provided_by_prefix(fonts_dir)
+
     if src:
         seen = set()
         for fname, family in named:
@@ -2074,15 +2144,25 @@ def ensure_simhei_font_links(fonts_dir: str, extra_families: Optional[List[Any]]
             if key in seen:
                 continue
             seen.add(key)
+
+            # Proton 已经用 simsun.ttc / msgothic.ttc 正确提供了这个家族。
+            # 再克隆一份同名的注册上去会把它盖掉，而我们的替身多半是比例字体，
+            # 于是排版反而坏掉（文字重叠/出框）。直接跳过。
+            if family in provided:
+                done.append(f"{fname}=skip(proton)")
+                continue
+
             dest = os.path.join(fonts_dir, fname)
             if ttf_family_visible_to_rgss(dest, family):
                 done.append(f"{fname}=ok")
                 continue
-            r = clone_ttf_with_family(src, dest, family)
-            if r and not str(r).startswith("error"):
-                done.append(f"{fname}:{r}")
-            else:
-                done.append(f"{fname}:{r}")
+
+            # 等宽家族必须用等宽源；拿不到等宽源时退回 src，
+            # 至少保证字能显示（宁可排版将就，也别缺字）。
+            use = mono_src if (family in _MONO_FAMILIES and mono_src) else src
+            r = clone_ttf_with_family(use, dest, family)
+            tag = "mono" if use is mono_src else "prop"
+            done.append(f"{fname}:{r}({tag})")
     return done
 
 
@@ -2130,7 +2210,16 @@ def patch_proton_prefix_cjk(
             with open(reg_path, "r", encoding="utf-8", errors="surrogateescape") as fp:
                 raw = fp.read()
             new, changes = patch_reg_text_locale(raw, preset, is_system=is_system)
-            new2, extra_chg = register_reg_font_families(new, extra_families or [], is_system=is_system)
+            # 与 ensure_simhei_font_links 保持一致：Proton 已正确提供的家族不注册，
+            # 否则注册表里会出现同名双份，我们这份（多半是比例字体）会把
+            # Proton 的等宽字体盖掉，排版就坏了。
+            reg_families = [
+                f
+                for f in (extra_families or [])
+                if str((f.get("family") if isinstance(f, dict) else f) or "")
+                not in _families_provided_by_prefix(fonts_dir)
+            ]
+            new2, extra_chg = register_reg_font_families(new, reg_families, is_system=is_system)
             new = new2
             changes.extend(extra_chg)
             if new != raw:

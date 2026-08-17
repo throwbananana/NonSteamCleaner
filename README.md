@@ -2,7 +2,7 @@
 
 Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏。
 
-版本 **1.5.1**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
+版本 **1.5.2**。 [![Release](https://img.shields.io/github/v/release/throwbananana/NonSteamCleaner)](https://github.com/throwbananana/NonSteamCleaner/releases/latest)
 
 ## 功能
 
@@ -55,6 +55,15 @@ Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏�
 - 中文补丁额外映射黑体 / SimHei
 
 详情页和右键可选语言；插件面板可批量修。
+
+替换字体时遵守两条规则，否则字能显示但**排版会坏**（文字挤在一起、出框、显示不全）：
+
+- **Proton 已经正确提供的家族不覆盖。** Proton 自带 `simsun.ttc`、`msgothic.ttc`，
+  它们提供的 SimSun / 宋体 / MS Gothic / ＭＳ ゴシック 等都是真正的等宽字体。
+  再克隆一份同名的注册上去只会把它们盖掉。
+- **等宽家族用等宽源。** 老游戏按「CJK = 全角、ASCII = 半角」的固定像素宽度排版，
+  拿微软雅黑这类比例字体去冒充 SimSun / SimHei，引擎算的坐标和实际绘制宽度对不上。
+  只有本身就是比例字体的家族（雅黑、Meiryo、各种 `Ｐ` 开头的）才用比例源。
 
 #### 自动检测该用哪个语言
 
