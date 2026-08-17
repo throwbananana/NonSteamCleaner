@@ -636,6 +636,66 @@ def _first_font_from_ttc(raw: bytes) -> bytes:
         return b""
 
 
+def force_em_box_metrics(raw: bytes) -> bytes:
+    """把字体的垂直度量压回 em 方框（ascent + descent = 1.0 em）。
+
+    为什么必须做：老的日文/汉化游戏用 GDI 按「固定像素高度」申请字体，再把
+    字形绘进同样高度的格子里。而现代 CJK 字体（Noto/Source Han 及由它派生的
+    微软雅黑、Proton 的 simsun.ttc）的 winAscent+winDescent 普遍是 1.45 em ——
+    游戏要 N 像素高，实际字形有 1.45N 高，超出格子的部分被裁掉，表现为
+    **每个字的上下都缺一截**。
+
+    参照 Proton 的 msgothic.ttc（它是照原版 MS ゴシック 的度量做的，正好
+    0.859 / 0.141 = 1.000 em）把 hhea 和 OS/2 改写成同样比例。
+    只改这两张表里的几个数值，不动字形，长度不变，因此表目录里只需
+    重算校验和。
+
+    注意不能直接改用 msgothic.ttc 当字体源：它是日文字体，缺「兰汉组寻爱护简」
+    等常用简体字。字形覆盖必须来自 simsun.ttc，度量则从这里修正。
+    """
+    import struct as _st
+
+    ASC_RATIO, DESC_RATIO = 0.859, 0.141
+    try:
+        if len(raw) < 12 or raw[:4] not in (b"\x00\x01\x00\x00", b"true", b"OTTO"):
+            return raw
+        num = _st.unpack_from(">H", raw, 4)[0]
+        entries = {}
+        for i in range(num):
+            o = 12 + i * 16
+            tag = raw[o : o + 4]
+            _check, toff, tlen = _st.unpack_from(">III", raw, o + 4)
+            entries[tag] = (o, toff, tlen)
+        if b"head" not in entries or b"hhea" not in entries:
+            return raw
+        upem = _st.unpack_from(">H", raw, entries[b"head"][1] + 18)[0]
+        if not upem:
+            return raw
+        asc = int(round(upem * ASC_RATIO))
+        desc = int(round(upem * DESC_RATIO))
+
+        buf = bytearray(raw)
+        # hhea: ascender / descender / lineGap 位于表首 +4
+        ho = entries[b"hhea"][1]
+        _st.pack_into(">hhh", buf, ho + 4, asc, -desc, 0)
+        if b"OS/2" in entries:
+            oo = entries[b"OS/2"][1]
+            # sTypoAscender / sTypoDescender / sTypoLineGap 在 +68
+            _st.pack_into(">hhh", buf, oo + 68, asc, -desc, 0)
+            # usWinAscent / usWinDescent 在 +74 —— GDI 拿它算行高，最关键
+            _st.pack_into(">HH", buf, oo + 74, asc, desc)
+
+        # 改过的表要重算校验和，否则表目录里的值对不上
+        for tag in (b"hhea", b"OS/2"):
+            if tag not in entries:
+                continue
+            dir_o, toff, tlen = entries[tag]
+            _st.pack_into(">I", buf, dir_o + 4, _ttf_checksum(bytes(buf[toff : toff + tlen])))
+        return bytes(buf)
+    except Exception:  # noqa: BLE001
+        return raw
+
+
 def clone_ttf_with_family(src: str, dest: str, family: str) -> str:
     """复制 TTF 并把字体族名改成 family。
 
@@ -651,6 +711,9 @@ def clone_ttf_with_family(src: str, dest: str, family: str) -> str:
         extracted = _first_font_from_ttc(raw)
         if extracted:
             raw = extracted
+    # 现代 CJK 字体的 ascent+descent 普遍是 1.45 em，直接拿去给按固定像素高度
+    # 排版的老游戏用，每个字的上下都会被格子裁掉。压回 1.0 em 再改名。
+    raw = force_em_box_metrics(raw)
     if len(raw) < 64 or raw[:4] not in (b"\x00\x01\x00\x00", b"true", b"OTTO"):
         # 非标准 TTF，退回拷贝
         try:

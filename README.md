@@ -56,7 +56,14 @@ Steam Deck 的 **Decky Loader** 插件，用来管理库里的非 Steam 游戏�
 
 详情页和右键可选语言；插件面板可批量修。
 
-替换字体时遵守两条规则，否则字能显示但**排版会坏**（文字挤在一起、出框、显示不全）：
+替换字体时遵守三条规则，否则字能显示但**排版会坏**：
+
+- **垂直度量压回 1.0 em。** 现代 CJK 字体（Noto / Source Han 及其派生的微软雅黑、
+  Proton 的 `simsun.ttc`）的 `ascent + descent` 普遍是 **1.45 em**。老游戏用 GDI 按
+  固定像素高度申请字体、把字形绘进同样高度的格子，于是每个字的上下各被裁掉一截。
+  克隆时按 Proton `msgothic.ttc` 的比例（0.859 / 0.141）改写 `hhea` 与 `OS/2` 的
+  `winAscent`/`winDescent`，只动这几个数值，不碰字形。
+  （不能直接改用 `msgothic.ttc` 当字体源 —— 它是日文字体，缺「兰汉组寻爱护简」等常用简体字。）
 
 - **Proton 已经正确提供的家族不覆盖。** Proton 自带 `simsun.ttc`、`msgothic.ttc`，
   它们提供的 SimSun / 宋体 / MS Gothic / ＭＳ ゴシック 等都是真正的等宽字体。
